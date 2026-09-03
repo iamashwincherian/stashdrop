@@ -37,6 +37,24 @@ interface Disc {
   n: string;
 }
 
+// The paste-to-keep flow: pasting a URL opens this "slip" — reading, then a
+// preview of what will be kept. Clicking Save promotes it into a "ghost"
+// that flies out of the slip and follows the cursor until you click the
+// desk to put it down (see startPlacing/placeGhost below).
+interface PendingCapture {
+  pid: string;
+  url: string;
+  host: string;
+  status: "reading" | "ready" | "error";
+  item?: StashItem;
+  clusterName?: string;
+  errorText?: string;
+}
+interface GhostCapture extends PendingCapture {
+  phase: "flying" | "landing" | "held";
+  rect: { left: number; top: number; width: number } | null;
+}
+
 interface CanvasProps {
   initialItems: StashItem[];
   initialBucket: Record<string, string>;
@@ -72,7 +90,11 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   // window-level pointermove/pointerup handlers — registered once on mount,
   // see below — always see the latest value even when pointerdown and the
   // following pointermove land in the same tick, before React re-renders.
-  const liveRef = useRef({ dragId: null as string | null, panning: false, scale: DEFAULT_CAMERA.scale });
+  const liveRef = useRef({
+    dragId: null as string | null, panning: false, scale: DEFAULT_CAMERA.scale,
+    aiming: false, lastCursor: [0, 0] as [number, number],
+    pending: null as PendingCapture | null, ghost: null as GhostCapture | null,
+  });
 
   const setCamera = useCallback((updater: typeof DEFAULT_CAMERA | ((s: typeof DEFAULT_CAMERA) => typeof DEFAULT_CAMERA)) => {
     setCameraState((prev) => {
@@ -106,6 +128,27 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [brokenImages, setBrokenImages] = useState<Set<string>>(new Set());
   const [disc, setDisc] = useState({ highlights: false, related: false, context: false });
   const [capture, setCapture] = useState<Capture | null>(null);
+
+  const [pendingState, setPendingState] = useState<PendingCapture | null>(null);
+  const setPending = useCallback((updater: PendingCapture | null | ((prev: PendingCapture | null) => PendingCapture | null)) => {
+    setPendingState((prev) => {
+      const next = typeof updater === "function" ? (updater as (p: PendingCapture | null) => PendingCapture | null)(prev) : updater;
+      liveRef.current.pending = next;
+      return next;
+    });
+  }, []);
+  const [ghostState, setGhostState] = useState<GhostCapture | null>(null);
+  const setGhost = useCallback((updater: GhostCapture | null | ((prev: GhostCapture | null) => GhostCapture | null)) => {
+    setGhostState((prev) => {
+      const next = typeof updater === "function" ? (updater as (p: GhostCapture | null) => GhostCapture | null)(prev) : updater;
+      liveRef.current.ghost = next;
+      return next;
+    });
+  }, []);
+  const [cursor, setCursor] = useState<[number, number]>([0, 0]);
+  const [landedId, setLandedId] = useState<string | null>(null);
+  const thumbRef = useRef<HTMLDivElement>(null);
+  const cancelledPidsRef = useRef<Set<string>>(new Set());
 
   const [theme, setThemeState] = useState<Theme>("system");
   useEffect(() => {
@@ -210,8 +253,20 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   }, [zoomAt]);
 
   useEffect(() => {
+    // Inlined rather than calling cancelPending() (declared further below,
+    // after this effect in source order — referencing it here would throw
+    // on first render, before that const is initialized). setPending/
+    // setGhost are already stable by this point, so this stays safe.
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        const p = liveRef.current.pending || liveRef.current.ghost;
+        if (p) {
+          cancelledPidsRef.current.add(p.pid);
+          if (p.item) void deleteItem(p.item.id);
+        }
+        liveRef.current.aiming = false;
+        setPending(null);
+        setGhost(null);
         setFocusId(null);
         setQueryState("");
         setSearchResults([]);
@@ -219,7 +274,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [setPending, setGhost]);
 
   // Reset the edit/delete-confirm UI whenever the focused item changes.
   // Adjusted during render (React's documented pattern for this) rather
@@ -241,6 +296,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   useEffect(() => {
     const move = (e: PointerEvent) => {
+      liveRef.current.lastCursor = [e.clientX, e.clientY];
+      if (liveRef.current.aiming) setCursor(liveRef.current.lastCursor);
       const id = liveRef.current.dragId;
       if (id) {
         dragDistanceRef.current += Math.abs(e.movementX) + Math.abs(e.movementY);
@@ -268,33 +325,100 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     };
   }, [setPos, setCamera, endDragAndPan]);
 
-  function paste(): boolean {
-    const q = query.trim();
-    if (!/^https?:\/\/|^www\./i.test(q)) return false;
-    const url = /^https?:\/\//i.test(q) ? q : `https://${q}`;
+  const isUrl = (v: string) => /^https?:\/\/|^www\./i.test(v.trim());
+
+  // Cancel whatever's in flight: if the item was already created (keepUrl
+  // resolved before the user backed out), delete it so it doesn't sit
+  // orphaned in the DB, invisible, forever. If keepUrl hasn't resolved yet,
+  // mark the pid so beginCapture cleans up as soon as it does.
+  const cancelPending = useCallback(() => {
+    liveRef.current.aiming = false;
+    const p = liveRef.current.pending || liveRef.current.ghost;
+    if (p) {
+      cancelledPidsRef.current.add(p.pid);
+      if (p.item) void deleteItem(p.item.id);
+    }
+    setPending(null);
+    setGhost(null);
+  }, [setPending, setGhost]);
+
+  async function beginCapture(rawUrl: string) {
+    const full = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+    let host = full;
+    try { host = new URL(full).hostname.replace(/^www\./, ""); } catch { /* keep raw as fallback */ }
+    const pid = "p" + Date.now().toString(36) + Math.round(Math.random() * 100);
+
     setQueryState("");
     setSearchResults([]);
-    if (captureTimerRef.current) window.clearTimeout(captureTimerRef.current);
-    setCapture({ text: "Reading it…", dot: "var(--text-fainter)", anim: "sd-breathe 1.1s ease-in-out infinite" });
-    (async () => {
-      const result = await keepUrl(url);
-      if ("error" in result) {
-        showCapture({ text: result.error, dot: "var(--accent)", anim: "none" });
-        return;
-      }
-      if ("duplicate" in result) {
-        setFocusId(result.duplicate.id);
-        showCapture({ text: "Already kept", dot: "var(--text-fainter)", anim: "none" });
-        return;
-      }
-      const { item, clusterName } = result;
-      setItems((prev) => [...prev, item]);
-      setBucket((prev) => ({ ...prev, [item.id]: "This week" }));
-      setRecentOrder((prev) => [item.id, ...prev]);
-      setPos((prev) => ({ ...prev, [item.id]: [item.x, item.y] }));
-      showCapture({ text: `Kept — put next to ${clusterName}`, dot: "#3F5A52", anim: "none", where: "gemma4:e2b, local" });
-    })();
-    return true;
+    setSearching(false);
+    if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+    setPending({ pid, url: full, host, status: "reading" });
+
+    const result = await keepUrl(full);
+
+    if (cancelledPidsRef.current.has(pid)) {
+      cancelledPidsRef.current.delete(pid);
+      if (!("error" in result) && !("duplicate" in result)) void deleteItem(result.item.id);
+      return;
+    }
+    if ("error" in result) {
+      setPending((prev) => (prev?.pid === pid ? { ...prev, status: "error", errorText: result.error } : prev));
+      later(() => setPending((prev) => (prev?.pid === pid ? null : prev)), 2600);
+      return;
+    }
+    if ("duplicate" in result) {
+      setPending((prev) => (prev?.pid === pid ? null : prev));
+      setFocusId(result.duplicate.id);
+      showCapture({ text: "Already kept", dot: "var(--text-fainter)", anim: "none" });
+      return;
+    }
+    setPending((prev) => (prev?.pid === pid ? { ...prev, status: "ready", item: result.item, clusterName: result.clusterName } : prev));
+  }
+
+  // Save doesn't file the card — it hands it to you. The slip's thumbnail
+  // flies out and becomes a "ghost" that follows the cursor until you click
+  // the desk to put it down (placeGhost).
+  function startPlacing() {
+    const p = pendingState;
+    if (!p || p.status !== "ready") return;
+    const el = thumbRef.current;
+    const r = el ? el.getBoundingClientRect() : null;
+    const rect = r ? { left: r.left, top: r.top, width: r.width } : null;
+    const target = liveRef.current.lastCursor[0] || liveRef.current.lastCursor[1]
+      ? liveRef.current.lastCursor
+      : ([window.innerWidth / 2 - 110, window.innerHeight / 2 - 70] as [number, number]);
+    setPending(null);
+    setCursor(target);
+    setGhost({ ...p, phase: rect ? "flying" : "held", rect });
+    if (!rect) { liveRef.current.aiming = true; return; }
+    const pid = p.pid;
+    const land = () => setGhost((prev) => (prev && prev.pid === pid && prev.phase === "flying" ? { ...prev, phase: "landing" } : prev));
+    const hold = () => {
+      liveRef.current.aiming = true;
+      setGhost((prev) => (prev && prev.pid === pid && prev.phase !== "held" ? { ...prev, phase: "held" } : prev));
+    };
+    requestAnimationFrame(() => requestAnimationFrame(land));
+    later(land, 60);
+    later(hold, 500);
+  }
+
+  function placeGhost(clientX: number, clientY: number) {
+    const g = liveRef.current.ghost;
+    if (!g || !g.item) return;
+    liveRef.current.aiming = false;
+    const x = (clientX - camera.tx) / camera.scale - 98;
+    const y = (clientY - camera.ty) / camera.scale - 60;
+    const item = g.item;
+    const clusterName = g.clusterName || "Unsorted";
+    setGhost(null);
+    void savePosition(item.id, x, y);
+    setItems((prev) => [...prev, { ...item, x, y }]);
+    setBucket((prev) => ({ ...prev, [item.id]: "This week" }));
+    setRecentOrder((prev) => [item.id, ...prev]);
+    setPos((prev) => ({ ...prev, [item.id]: [x, y] }));
+    setLandedId(item.id);
+    later(() => setLandedId((prev) => (prev === item.id ? null : prev)), 700);
+    showCapture({ text: `Kept — you put it in ${clusterName}`, dot: "#3F5A52", anim: "none", where: "placed by hand" });
   }
 
   function triggerSearch(value: string) {
@@ -314,10 +438,11 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   function onChangeQuery(value: string) {
     setQueryState(value);
-    if (/^https?:\/\/|^www\./i.test(value.trim())) {
+    if (isUrl(value)) {
       if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
       setSearchResults([]);
       setSearching(false);
+      void beginCapture(value.trim());
     } else {
       triggerSearch(value);
     }
@@ -325,7 +450,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   function queryKey(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "Enter") {
-      if (paste()) return;
+      if (pendingState?.status === "ready") { startPlacing(); return; }
       if (searchResults.length) {
         setFocusId(searchResults[0].id);
         setDisc({ highlights: false, related: false, context: false });
@@ -363,26 +488,27 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     ? Object.fromEntries(searchResults.map((h) => [h.id, h.score]))
     : null;
   const zoomedOut = camera.scale < 0.6;
+  const barOpen = !!query || !!pendingState || !!ghostState;
 
   const focused = focusId ? items.find((o) => o.id === focusId) ?? null : null;
   const focusedRelated = focused
     ? focused.related
-        .map((rid) => {
-          const r = items.find((o) => o.id === rid);
-          if (!r) return null;
-          return { id: rid, title: r.title, mark: MARK[r.kind], why: WHY_RELATED[rid] || "related" };
-        })
-        .filter((r): r is NonNullable<typeof r> => r !== null)
+      .map((rid) => {
+        const r = items.find((o) => o.id === rid);
+        if (!r) return null;
+        return { id: rid, title: r.title, mark: MARK[r.kind], why: WHY_RELATED[rid] || "related" };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null)
     : [];
 
   const discs: Disc[] = focused && focused.kind !== "comment"
     ? (
-        [
-          { key: "highlights" as const, label: "Highlights & notes", n: String(focused.highlights.length + (focused.note ? 1 : 0)) },
-          { key: "related" as const, label: "Related", n: String(focused.related.length) },
-          { key: "context" as const, label: "Why it is here", n: "" },
-        ].filter((d) => d.key !== "highlights" || focused.highlights.length > 0 || !!focused.note)
-      )
+      [
+        { key: "highlights" as const, label: "Highlights & notes", n: String(focused.highlights.length + (focused.note ? 1 : 0)) },
+        { key: "related" as const, label: "Related", n: String(focused.related.length) },
+        { key: "context" as const, label: "Why it is here", n: "" },
+      ].filter((d) => d.key !== "highlights" || focused.highlights.length > 0 || !!focused.note)
+    )
     : [];
 
   let listGroups: { name: string; n: string; items: StashItem[] }[] = [];
@@ -428,7 +554,10 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     >
       <div
         ref={canvasRef}
-        onPointerDown={() => { startPan(); setFocusId(null); }}
+        onPointerDown={(e) => {
+          if (liveRef.current.ghost) { placeGhost(e.clientX, e.clientY); return; }
+          startPan(); setFocusId(null);
+        }}
         style={{
           position: "absolute", inset: 0, cursor: panning ? "grabbing" : "default",
           backgroundImage: "radial-gradient(circle at 1px 1px, rgba(var(--shadow-color),.055) 1px, transparent 0)",
@@ -478,16 +607,21 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 : "0 1px 2px rgba(var(--shadow-color),.05), 0 6px 16px rgba(var(--shadow-color),.045)"),
               opacity: dim ? 0.24 : 1,
               cursor: "grab",
+              animation: landedId === o.id ? "sd-land .6s ease-out both" : undefined,
               userSelect: "none", overflow: "hidden",
             };
 
             return (
               <div
                 key={o.id}
-                onPointerDown={(e) => { e.stopPropagation(); startDrag(o.id); }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  if (liveRef.current.ghost) { placeGhost(e.clientX, e.clientY); return; }
+                  startDrag(o.id);
+                }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false }); }
+                  if (!liveRef.current.ghost && dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false }); }
                 }}
                 onMouseEnter={() => setHoverId(o.id)}
                 onMouseLeave={() => setHoverId((h) => (h === o.id ? null : h))}
@@ -611,9 +745,9 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       <div style={{ position: "absolute", left: "50%", top: 16, transform: "translateX(-50%)", width: "min(560px, calc(100vw - 260px))", zIndex: 30 }}>
         <div style={{
           background: "var(--surface)", backdropFilter: "blur(12px)",
-          border: `1px solid ${query ? "var(--border-strong)" : "var(--border-default)"}`,
-          borderRadius: query ? 12 : 10,
-          boxShadow: query ? "0 14px 40px rgba(var(--shadow-color),.11)" : "0 2px 10px rgba(var(--shadow-color),.05)",
+          border: `1px solid ${barOpen ? "var(--border-strong)" : "var(--border-default)"}`,
+          borderRadius: barOpen ? 12 : 10,
+          boxShadow: barOpen ? "0 14px 40px rgba(var(--shadow-color),.11)" : "0 2px 10px rgba(var(--shadow-color),.05)",
           overflow: "hidden", transition: "box-shadow .18s ease",
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "0 14px" }}>
@@ -622,7 +756,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               value={query}
               onChange={(e) => onChangeQuery(e.target.value)}
               onKeyDown={queryKey}
-              placeholder="Find anything — or paste to keep it"
+              placeholder="Search anything — or paste to keep it"
               style={{ flex: 1, border: "none", outline: "none", background: "none", fontSize: 14.5, color: "var(--text-primary)", padding: "13px 0" }}
             />
             {query && (
@@ -634,7 +768,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             )}
           </div>
 
-          {query && !/^https?:\/\/|^www\./i.test(query.trim()) && (
+          {query && !isUrl(query) && (
             <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "9px 6px 8px" }}>
               {searching && !searchResults.length && (
                 <div style={{ padding: "8px 10px", fontFamily: MONO, fontSize: 11, color: "var(--text-faint)" }}>searching…</div>
@@ -660,8 +794,161 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               })}
             </div>
           )}
+
+          {pendingState && (
+            <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "13px 14px 12px", animation: "sd-slip .2s ease both" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <span style={{ width: 9, height: 9, borderRadius: 2, background: pendingState.item ? MARK[pendingState.item.kind] : "var(--text-muted)", flex: "none" }} />
+                <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".05em", color: "var(--text-muted)" }}>{pendingState.host}</span>
+                <div style={{ flex: 1 }} />
+                <span style={{
+                  fontFamily: MONO, fontSize: 9.5, letterSpacing: ".06em", textTransform: "uppercase",
+                  color: pendingState.status === "reading" ? "var(--text-faint)" : "var(--text-muted)",
+                  animation: pendingState.status === "reading" ? "sd-breathe 1.3s ease-in-out infinite" : undefined,
+                }}>
+                  {pendingState.status === "reading" ? "reading the page…" : pendingState.status === "error" ? "couldn't read it" : pendingState.item?.kind}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 13, alignItems: "flex-start" }}>
+                <div
+                  ref={thumbRef}
+                  style={{
+                    width: 104, height: 74, flex: "none", position: "relative", overflow: "hidden", borderRadius: 8,
+                    border: "1px solid var(--border-default)",
+                    background: pendingState.status === "ready" && pendingState.item ? (TINT[pendingState.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
+                  }}
+                >
+                  {pendingState.status === "ready" && pendingState.item?.image ? (
+                    <img
+                      src={pendingState.item.image}
+                      alt=""
+                      draggable={false}
+                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                    />
+                  ) : (
+                    bars(pendingState.status === "ready" && pendingState.item ? (pendingState.item.kind === "video" ? "image" : pendingState.item.kind) : "article", 7).map((b, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, borderRadius: b.r, background: b.bg,
+                          opacity: pendingState.status === "reading" ? 0.45 : 1,
+                          animation: pendingState.status === "reading" ? `sd-shimmer 1.2s ease-in-out ${i * 0.08}s infinite` : undefined,
+                        }}
+                      />
+                    ))
+                  )}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {pendingState.status === "reading" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7, paddingTop: 3 }}>
+                      <div style={{ height: 9, width: "72%", borderRadius: 3, background: "rgba(var(--ink-rgb),.13)", animation: "sd-shimmer 1.2s ease-in-out infinite" }} />
+                      <div style={{ height: 6, width: "94%", borderRadius: 3, background: "rgba(var(--ink-rgb),.08)", animation: "sd-shimmer 1.2s ease-in-out .15s infinite" }} />
+                      <div style={{ height: 6, width: "60%", borderRadius: 3, background: "rgba(var(--ink-rgb),.08)", animation: "sd-shimmer 1.2s ease-in-out .3s infinite" }} />
+                    </div>
+                  )}
+                  {pendingState.status === "error" && (
+                    <div style={{ fontSize: 13, color: "var(--danger)" }}>{pendingState.errorText}</div>
+                  )}
+                  {pendingState.status === "ready" && pendingState.item && (
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{pendingState.item.title}</div>
+                      <div style={{
+                        fontSize: 12.5, lineHeight: 1.5, color: "var(--text-muted)", marginTop: 5, textWrap: "pretty" as CSSProperties["textWrap"],
+                        display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden",
+                      }}>{pendingState.item.description}</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 9 }}>
+                        {pendingState.item.tags.map((t) => (
+                          <span key={t} style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-muted)", border: "1px solid var(--border-subtle)", borderRadius: 5, padding: "3px 7px" }}>{t}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
+                <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 13, color: pendingState.status === "reading" ? "var(--text-fainter)" : "var(--text-muted)" }}>
+                  {pendingState.status === "reading" ? "working out where it goes" : pendingState.status === "ready" ? `lands next to ${pendingState.clusterName}` : ""}
+                </div>
+                <div style={{ flex: 1 }} />
+                <button
+                  onClick={cancelPending}
+                  className="sd-hover-border"
+                  style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-muted)", borderRadius: 7, padding: "6px 11px", fontSize: 12, cursor: "pointer" }}
+                >Discard</button>
+                <button
+                  onClick={startPlacing}
+                  disabled={pendingState.status !== "ready"}
+                  style={{
+                    border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)",
+                    borderRadius: 7, padding: "6px 13px", fontSize: 12, fontWeight: 500,
+                    cursor: pendingState.status === "ready" ? "pointer" : "not-allowed", opacity: pendingState.status === "ready" ? 1 : 0.45,
+                  }}
+                >Save</button>
+              </div>
+            </div>
+          )}
+
+          {ghostState && (
+            <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "11px 14px", display: "flex", alignItems: "center", gap: 9, animation: "sd-slip .2s ease both" }}>
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: (ghostState.item && MARK[ghostState.item.kind]) || "var(--text-muted)", flex: "none" }} />
+              <div style={{ flex: 1, fontSize: 12.5, color: "var(--text-secondary)" }}>
+                {ghostState.phase === "held" ? "Click the desk to put it down" : "Picking it up…"}
+              </div>
+              <button
+                onClick={cancelPending}
+                className="sd-hover-fg"
+                style={{ border: "none", background: "none", color: "var(--text-faint)", fontFamily: MONO, fontSize: 11, cursor: "pointer", padding: 4 }}
+              >esc</button>
+            </div>
+          )}
         </div>
       </div>
+
+      {ghostState && (() => {
+        const g = ghostState;
+        const flying = g.phase === "flying" && !!g.rect;
+        const anchored = !!g.rect;
+        const ease = "cubic-bezier(.2,.8,.2,1)";
+        const dx = anchored ? cursor[0] + 16 - g.rect!.left : 0;
+        const dy = anchored ? cursor[1] + 14 - g.rect!.top : 0;
+        const heldT = `translate3d(${dx}px,${dy}px,0) scale(${camera.scale}) rotate(-1.5deg)`;
+        const ghostBars = bars(g.item ? (g.item.kind === "video" ? "image" : g.item.kind) : "article", 7);
+        return (
+          <div style={{
+            position: "fixed", width: 196, zIndex: 45, pointerEvents: "none",
+            left: anchored ? g.rect!.left : cursor[0] + 16,
+            top: anchored ? g.rect!.top : cursor[1] + 14,
+            transform: flying ? `translate3d(0,0,0) scale(${g.rect!.width / 196})` : heldT,
+            transformOrigin: "0 0",
+            opacity: flying ? 0.8 : 0.94,
+            transition: g.phase === "landing" ? `transform .42s ${ease}, opacity .42s ${ease}` : "none",
+            background: "var(--card-bg)", border: "1px solid var(--text-primary)",
+            borderRadius: 11, overflow: "hidden",
+            boxShadow: flying ? "0 8px 20px rgba(var(--shadow-color),.14)" : "0 22px 48px rgba(var(--shadow-color),.22)",
+          }}>
+            <div style={{
+              height: 96, position: "relative", overflow: "hidden", display: "grid", placeItems: "center",
+              borderBottom: "1px solid var(--border-default)",
+              background: g.item ? (TINT[g.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
+            }}>
+              {g.item?.image ? (
+                <img src={g.item.image} alt="" draggable={false} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }} />
+              ) : (
+                ghostBars.map((b, i) => (
+                  <div key={i} style={{ position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, borderRadius: b.r, background: b.bg }} />
+                ))
+              )}
+            </div>
+            <div style={{ padding: "11px 13px 12px" }}>
+              <div style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.3, textWrap: "pretty" as CSSProperties["textWrap"], color: "var(--text-primary)" }}>{g.item?.title}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 5 }}>
+                <span style={{ width: 9, height: 9, borderRadius: 2, background: (g.item && MARK[g.item.kind]) || "var(--text-muted)", flex: "none" }} />
+                <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)" }}>{g.host}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       <div style={{ position: "absolute", right: 22, top: 18, display: "flex", alignItems: "center", gap: 7, zIndex: 20 }}>
         <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, padding: 2 }}>
