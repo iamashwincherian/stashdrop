@@ -17,6 +17,7 @@
   --border-default: #E4E0D6;
   --border-subtle: #EDE9DF;
   --border-strong: #DED9CB;
+  --border-hover: #B7B2A2;
 
   --accent: #8A5A3B;
   --accent-bg: #FBF8EE;
@@ -72,6 +73,7 @@
     --border-default: #3A382F;
     --border-subtle: #322F28;
     --border-strong: #4A473C;
+    --border-hover: #6B675A;
 
     --accent: #D19A6E;
     --accent-bg: #2E2A1E;
@@ -124,6 +126,7 @@
   --border-default: #3A382F;
   --border-subtle: #322F28;
   --border-strong: #4A473C;
+  --border-hover: #6B675A;
 
   --accent: #D19A6E;
   --accent-bg: #2E2A1E;
@@ -172,6 +175,7 @@ input, textarea, button { font-family: var(--font-sans), system-ui, sans-serif; 
 @keyframes sd-land { from { outline: 2px solid var(--accent); outline-offset: 2px } to { outline: 2px solid rgba(138,90,59,0); outline-offset: 12px } }
 @keyframes sd-shimmer { 0%, 100% { opacity: .3 } 50% { opacity: .65 } }
 @keyframes sd-slip { from { opacity: 0; transform: translateY(-6px) } to { opacity: 1; transform: none } }
+@keyframes sd-fade { from { opacity: 0 } to { opacity: 1 } }
 
 .sd-hover-fg:hover { color: var(--text-primary); }
 .sd-hover-bg:hover { background: var(--hover-bg); color: var(--text-primary); }

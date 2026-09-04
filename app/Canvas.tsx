@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useRouter } from "next/navigation";
 import {
   CLUSTERS,
   MARK,
@@ -11,7 +12,11 @@ import {
   type StashItem,
   type Kind,
 } from "@/lib/data";
-import { keepUrl, savePosition, deleteItem, updateItemFields, searchItems, addComment, type SearchHit } from "@/lib/actions";
+import { keepUrl, getItem, savePosition, deleteItem, trashItem, restoreItem, emptyTrash, listTrash, updateItemFields, searchItems, addComment, type SearchHit, type KeepResult } from "@/lib/actions";
+import { Trash2, Sun, Moon, Monitor, Pencil, ChevronDown, Settings as SettingsIcon } from "lucide-react";
+import Onboarding from "./Onboarding";
+import ProjectSettingsModal from "./ProjectSettingsModal";
+import UserMenu from "./UserMenu";
 
 const PAPER = "var(--paper)";
 const SERIF = "var(--font-serif), serif";
@@ -59,11 +64,16 @@ interface CanvasProps {
   initialItems: StashItem[];
   initialBucket: Record<string, string>;
   initialRecentOrder: string[];
+  user: { name: string; email: string };
+  needsOnboarding: boolean;
 }
 
-export default function Canvas({ initialItems, initialBucket, initialRecentOrder }: CanvasProps) {
+export default function Canvas({ initialItems, initialBucket, initialRecentOrder, user, needsOnboarding }: CanvasProps) {
+  const router = useRouter();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const timeoutsRef = useRef<number[]>([]);
+  const openInEditRef = useRef(false);
 
   const [items, setItems] = useState<StashItem[]>(initialItems);
   const [recentOrder, setRecentOrder] = useState<string[]>(initialRecentOrder);
@@ -211,6 +221,11 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [editTags, setEditTags] = useState("");
   const [editNote, setEditNote] = useState("");
   const [deleteArmed, setDeleteArmed] = useState(false);
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [trashItems, setTrashItems] = useState<(StashItem & { deletedAt: number })[]>([]);
+  const [emptyArmed, setEmptyArmed] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
 
   const searchTimerRef = useRef<number | undefined>(undefined);
   const searchSeqRef = useRef(0);
@@ -268,6 +283,9 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         setPending(null);
         setGhost(null);
         setFocusId(null);
+        setTrashOpen(false);
+        setContextMenu(null);
+        setThemeMenuOpen(false);
         setQueryState("");
         setSearchResults([]);
       }
@@ -282,7 +300,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [lastFocusId, setLastFocusId] = useState(focusId);
   if (lastFocusId !== focusId) {
     setLastFocusId(focusId);
-    setEditing(false);
+    setEditing(openInEditRef.current);
+    openInEditRef.current = false;
     setDeleteArmed(false);
     const f = focusId ? items.find((o) => o.id === focusId) : null;
     setEditTitle(f ? f.title : "");
@@ -340,6 +359,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     }
     setPending(null);
     setGhost(null);
+    setQueryState("");
+    setSearchResults([]);
   }, [setPending, setGhost]);
 
   async function beginCapture(rawUrl: string) {
@@ -348,31 +369,65 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     try { host = new URL(full).hostname.replace(/^www\./, ""); } catch { /* keep raw as fallback */ }
     const pid = "p" + Date.now().toString(36) + Math.round(Math.random() * 100);
 
-    setQueryState("");
     setSearchResults([]);
     setSearching(false);
     if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
     setPending({ pid, url: full, host, status: "reading" });
 
-    const result = await keepUrl(full);
+    let result: KeepResult;
+    try {
+      result = await keepUrl(full);
+    } catch {
+      // keepUrl itself only throws on something unexpected (DB write
+      // failure, etc) — a merely-unreachable page is already handled
+      // inside it by falling back to a bare-URL item.
+      setPending((prev) => (prev?.pid === pid ? { ...prev, status: "error", errorText: "Something went wrong." } : prev));
+      later(() => setPending((prev) => (prev?.pid === pid ? null : prev)), 2600);
+      return;
+    }
 
     if (cancelledPidsRef.current.has(pid)) {
       cancelledPidsRef.current.delete(pid);
-      if (!("error" in result) && !("duplicate" in result)) void deleteItem(result.item.id);
-      return;
-    }
-    if ("error" in result) {
-      setPending((prev) => (prev?.pid === pid ? { ...prev, status: "error", errorText: result.error } : prev));
-      later(() => setPending((prev) => (prev?.pid === pid ? null : prev)), 2600);
+      if (!("duplicate" in result)) void deleteItem(result.item.id);
       return;
     }
     if ("duplicate" in result) {
       setPending((prev) => (prev?.pid === pid ? null : prev));
+      setQueryState("");
       setFocusId(result.duplicate.id);
       showCapture({ text: "Already kept", dot: "var(--text-fainter)", anim: "none" });
       return;
     }
     setPending((prev) => (prev?.pid === pid ? { ...prev, status: "ready", item: result.item, clusterName: result.clusterName } : prev));
+    pollEnrichment(result.item.id);
+  }
+
+  // AI enrichment (tags/description/context/highlights) now happens after
+  // the item is already captured, not before — see keepUrl's comment. This
+  // polls for that background pass to land and patches the item wherever
+  // it currently is: still the pending preview, a held/flying ghost, or
+  // already placed on the desk. Stops on its own once the item is gone
+  // (discarded) or enrichment lands; gives up after ~45s either way.
+  function applyEnrichment(id: string, patch: Partial<StashItem>) {
+    setPending((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
+    setGhost((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
+    setItems((prev) => prev.map((o) => (o.id === id ? { ...o, ...patch } : o)));
+  }
+
+  async function pollEnrichment(id: string) {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const res = await getItem(id);
+      if (!res) return; // discarded before enrichment landed
+      if (res.enrichedAt) {
+        applyEnrichment(id, {
+          tags: res.item.tags, description: res.item.description,
+          context: res.item.context, highlights: res.item.highlights,
+          related: res.item.related,
+        });
+        return;
+      }
+    }
   }
 
   // Save doesn't file the card — it hands it to you. The slip's thumbnail
@@ -388,6 +443,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       ? liveRef.current.lastCursor
       : ([window.innerWidth / 2 - 110, window.innerHeight / 2 - 70] as [number, number]);
     setPending(null);
+    setQueryState("");
     setCursor(target);
     setGhost({ ...p, phase: rect ? "flying" : "held", rect });
     if (!rect) { liveRef.current.aiming = true; return; }
@@ -476,10 +532,43 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       later(() => setDeleteArmed(false), 4000);
       return;
     }
-    await deleteItem(id);
+    await trashItem(id);
     setItems((prev) => prev.filter((o) => o.id !== id));
     setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
     setFocusId(null);
+    setDeleteArmed(false);
+  }
+
+  async function quickTrash(id: string) {
+    setContextMenu(null);
+    await trashItem(id);
+    setItems((prev) => prev.filter((o) => o.id !== id));
+    setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
+    setFocusId((f) => (f === id ? null : f));
+  }
+
+  async function openTrash() {
+    setTrashOpen(true);
+    setEmptyArmed(false);
+    setTrashItems(await listTrash());
+  }
+
+  async function handleRestore(item: StashItem) {
+    await restoreItem(item.id);
+    setTrashItems((prev) => prev.filter((o) => o.id !== item.id));
+    setItems((prev) => [...prev, item]);
+    setPos((prev) => ({ ...prev, [item.id]: [item.x, item.y] }));
+  }
+
+  async function handleEmptyTrash() {
+    if (!emptyArmed) {
+      setEmptyArmed(true);
+      later(() => setEmptyArmed(false), 4000);
+      return;
+    }
+    await emptyTrash();
+    setTrashItems([]);
+    setEmptyArmed(false);
   }
 
   // ---- derived render values ----
@@ -490,7 +579,9 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const zoomedOut = camera.scale < 0.6;
   const barOpen = !!query || !!pendingState || !!ghostState;
 
-  const focused = focusId ? items.find((o) => o.id === focusId) ?? null : null;
+  const contextMenuItem = contextMenu ? items.find((o) => o.id === contextMenu.id) ?? null : null;
+  const focusedTrashed = !!focusId && !items.some((o) => o.id === focusId);
+  const focused = focusId ? items.find((o) => o.id === focusId) ?? trashItems.find((o) => o.id === focusId) ?? null : null;
   const focusedRelated = focused
     ? focused.related
       .map((rid) => {
@@ -586,28 +677,48 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             const hovered = hoverId === o.id;
             const dim = !!(hits && !hit);
             const isText = !!o.isText;
-            const previewH = (o.kind === "image" || o.kind === "shot" ? 118 : 96);
+            const previewH = (o.kind === "image" || o.kind === "shot" ? 135 : 110);
             const previewBars = isText ? [] : bars(o.kind === "video" ? "image" : o.kind, o.id.charCodeAt(1) || 3);
             const titleOp = zoomedOut && !hit ? 0.35 : 1;
 
             const tilt = o.kind === "quote" || o.kind === "note" || o.kind === "comment" ? "-0.5deg" : "0deg";
+            const isMenuTarget = contextMenu?.id === o.id;
+            const isMenuBackground = !!contextMenu && !isMenuTarget;
             const style: CSSProperties = {
               // Positioned via transform, not left/top: left/top changes force
               // a layout+repaint on every pointermove frame, which is what
               // made image-heavy cards visibly stutter/redraw mid-drag.
               // translate3d is compositor-only — no repaint, no jank.
-              position: "absolute", left: 0, top: 0, width: o.w,
-              transform: `translate3d(${x}px, ${y}px, 0) rotate(${tilt})`,
-              willChange: dragId === o.id ? "transform" : undefined,
+              position: "absolute", left: 0, top: 0, width: o.w * 1.15,
+              transform: `translate3d(${x}px, ${y}px, 0) rotate(${tilt}) scale(${isMenuTarget ? 1.06 : 1})`,
+              // Keeps the card on its own compositing layer at all times —
+              // toggling this only on hover/drag made the browser promote
+              // and re-rasterize the layer mid-interaction, which is what
+              // made text visibly shiver/refocus on hover.
+              willChange: "transform",
+              backfaceVisibility: "hidden",
               background: o.kind === "comment" ? "var(--sticky-bg)" : o.kind === "quote" ? "var(--card-bg-alt)" : "var(--card-bg)",
-              border: `1px solid ${hit || hovered ? "var(--text-primary)" : o.kind === "comment" ? "var(--sticky-border)" : "var(--border-default)"}`,
+              border: `1px solid ${hit || hovered ? "var(--border-hover)" : o.kind === "comment" ? "var(--sticky-border)" : "var(--border-default)"}`,
               borderRadius: isText ? 10 : 11,
-              boxShadow: dim ? "none" : (hovered || hit || dragId === o.id
-                ? "0 12px 30px rgba(var(--shadow-color),.13)"
-                : "0 1px 2px rgba(var(--shadow-color),.05), 0 6px 16px rgba(var(--shadow-color),.045)"),
-              opacity: dim ? 0.24 : 1,
+              opacity: isMenuBackground ? 0.5 : dim ? 0.24 : 1,
+              // Shadow is drop-shadow(), not box-shadow: box-shadow changes
+              // force a repaint (CPU re-rasterize) of the whole layer, and
+              // inside this card's scaled ancestor that repaint redraws text
+              // at a shifting subpixel offset — the hover "shiver". filter is
+              // compositor-only, so the already-rasterized text just gets
+              // re-composited, never redrawn.
+              filter: [
+                isMenuBackground && "blur(5px)",
+                isMenuTarget ? "drop-shadow(0 24px 60px rgba(var(--shadow-color),.28))"
+                  : dim ? null : (hovered || hit || dragId === o.id)
+                  ? "drop-shadow(0 12px 30px rgba(var(--shadow-color),.13))"
+                  : "drop-shadow(0 1px 2px rgba(var(--shadow-color),.05)) drop-shadow(0 6px 16px rgba(var(--shadow-color),.045))",
+              ].filter(Boolean).join(" ") || undefined,
               cursor: "grab",
               animation: landedId === o.id ? "sd-land .6s ease-out both" : undefined,
+              transition: dragId === o.id ? undefined : "transform .18s cubic-bezier(.2,.8,.2,1), filter .18s ease, opacity .18s ease",
+              zIndex: isMenuTarget ? 62 : undefined,
+              pointerEvents: isMenuBackground ? "none" : undefined,
               userSelect: "none", overflow: "hidden",
             };
 
@@ -623,13 +734,18 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   e.stopPropagation();
                   if (!liveRef.current.ghost && dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false }); }
                 }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setContextMenu({ id: o.id, x: e.clientX, y: e.clientY });
+                }}
                 onMouseEnter={() => setHoverId(o.id)}
                 onMouseLeave={() => setHoverId((h) => (h === o.id ? null : h))}
                 style={style}
               >
                 {!isText && (
                   <div style={{
-                    height: previewH, background: TINT[o.kind] || "var(--tint-article)", borderBottom: `1px solid ${hit || hovered ? "var(--text-primary)" : "var(--border-default)"}`,
+                    height: previewH, background: TINT[o.kind] || "var(--tint-article)", borderBottom: `1px solid ${hit || hovered ? "var(--border-hover)" : "var(--border-default)"}`,
                     position: "relative", display: "grid", placeItems: "center", overflow: "hidden",
                   }}>
                     {o.image && !brokenImages.has(o.id) ? (
@@ -646,27 +762,27 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                       ))
                     )}
                     {o.playhead && (
-                      <div style={{ position: "relative", width: 26, height: 26, borderRadius: "50%", background: "var(--surface)", border: "1px solid rgba(var(--shadow-color),.14)", display: "grid", placeItems: "center" }}>
-                        <div style={{ width: 0, height: 0, borderLeft: "7px solid var(--text-secondary)", borderTop: "4.5px solid transparent", borderBottom: "4.5px solid transparent", marginLeft: 2 }} />
+                      <div style={{ position: "relative", width: 30, height: 30, borderRadius: "50%", background: "var(--surface)", border: "1px solid rgba(var(--shadow-color),.14)", display: "grid", placeItems: "center" }}>
+                        <div style={{ width: 0, height: 0, borderLeft: "8px solid var(--text-secondary)", borderTop: "5px solid transparent", borderBottom: "5px solid transparent", marginLeft: 2 }} />
                       </div>
                     )}
                   </div>
                 )}
 
                 {isText && (
-                  <div style={{ padding: "14px 15px 4px" }}>
-                    <div style={{ fontFamily: SERIF, fontStyle: o.kind === "quote" ? "italic" : "normal", fontSize: 17, lineHeight: 1.3, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.body}</div>
+                  <div style={{ padding: "16px 17px 5px" }}>
+                    <div style={{ fontFamily: SERIF, fontStyle: o.kind === "quote" ? "italic" : "normal", fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.body}</div>
                   </div>
                 )}
 
-                <div style={{ padding: isText ? "4px 15px 14px" : "12px 14px 13px" }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", opacity: titleOp, textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.title}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 5, opacity: titleOp }}>
-                    <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[o.kind] || "var(--text-muted)", flex: "none" }} />
-                    <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.domain}</span>
+                <div style={{ padding: isText ? "5px 17px 16px" : "14px 16px 15px" }}>
+                  <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", opacity: titleOp, textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.title}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 6, opacity: titleOp }}>
+                    <span style={{ width: 10, height: 10, borderRadius: 2, background: MARK[o.kind] || "var(--text-muted)", flex: "none" }} />
+                    <span style={{ fontFamily: MONO, fontSize: 10.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.domain}</span>
                   </div>
                   {hit != null && (
-                    <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 13, lineHeight: 1.3, color: "var(--text-muted)", marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border-subtle)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{matchLabel(hit)}</div>
+                    <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 14.5, lineHeight: 1.3, color: "var(--text-muted)", marginTop: 9, paddingTop: 9, borderTop: "1px solid var(--border-subtle)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{matchLabel(hit)}</div>
                   )}
                 </div>
               </div>
@@ -756,12 +872,13 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               value={query}
               onChange={(e) => onChangeQuery(e.target.value)}
               onKeyDown={queryKey}
+              readOnly={!!pendingState}
               placeholder="Search anything — or paste to keep it"
-              style={{ flex: 1, border: "none", outline: "none", background: "none", fontSize: 14.5, color: "var(--text-primary)", padding: "13px 0" }}
+              style={{ flex: 1, border: "none", outline: "none", background: "none", fontSize: 14.5, color: "var(--text-primary)", padding: "13px 0", cursor: pendingState ? "default" : "text" }}
             />
             {query && (
               <button
-                onClick={() => { setQueryState(""); setSearchResults([]); }}
+                onClick={() => { if (pendingState) { cancelPending(); } else { setQueryState(""); setSearchResults([]); } }}
                 className="sd-hover-fg"
                 style={{ border: "none", background: "none", color: "var(--text-faint)", fontFamily: MONO, fontSize: 12, cursor: "pointer", padding: 4 }}
               >esc</button>
@@ -818,12 +935,13 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                     background: pendingState.status === "ready" && pendingState.item ? (TINT[pendingState.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
                   }}
                 >
-                  {pendingState.status === "ready" && pendingState.item?.image ? (
+                  {pendingState.status === "ready" && pendingState.item?.image && !brokenImages.has(pendingState.item.id) ? (
                     <img
                       src={pendingState.item.image}
                       alt=""
                       draggable={false}
                       style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                      onError={() => setBrokenImages((prev) => new Set(prev).add(pendingState.item!.id))}
                     />
                   ) : (
                     bars(pendingState.status === "ready" && pendingState.item ? (pendingState.item.kind === "video" ? "image" : pendingState.item.kind) : "article", 7).map((b, i) => (
@@ -867,7 +985,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
                 <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 13, color: pendingState.status === "reading" ? "var(--text-fainter)" : "var(--text-muted)" }}>
-                  {pendingState.status === "reading" ? "working out where it goes" : pendingState.status === "ready" ? `lands next to ${pendingState.clusterName}` : ""}
+                  {pendingState.status === "reading" ? "fetching page details" : pendingState.status === "ready" ? `lands next to ${pendingState.clusterName}` : ""}
                 </div>
                 <div style={{ flex: 1 }} />
                 <button
@@ -931,8 +1049,14 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               borderBottom: "1px solid var(--border-default)",
               background: g.item ? (TINT[g.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
             }}>
-              {g.item?.image ? (
-                <img src={g.item.image} alt="" draggable={false} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }} />
+              {g.item?.image && !brokenImages.has(g.item.id) ? (
+                <img
+                  src={g.item.image}
+                  alt=""
+                  draggable={false}
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                  onError={() => setBrokenImages((prev) => new Set(prev).add(g.item!.id))}
+                />
               ) : (
                 ghostBars.map((b, i) => (
                   <div key={i} style={{ position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, borderRadius: b.r, background: b.bg }} />
@@ -964,19 +1088,56 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             >{v.label}</button>
           ))}
         </div>
-        <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, padding: 2 }}>
-          {([{ id: "system" as const, label: "Auto" }, { id: "light" as const, label: "Light" }, { id: "dark" as const, label: "Dark" }]).map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTheme(t.id)}
-              className="sd-hover-fg"
-              title={t.id === "system" ? "Follow system theme" : `${t.label} theme`}
-              style={{ border: "none", background: theme === t.id ? "var(--hover-bg)" : "transparent", color: theme === t.id ? "var(--text-primary)" : "var(--text-muted)", borderRadius: 6, padding: "6px 10px", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
-            >{t.label}</button>
-          ))}
+        <button
+          onClick={openTrash}
+          title="Trash"
+          aria-label="Trash"
+          className="sd-hover-border-fg"
+          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer" }}
+        ><Trash2 size={14} /></button>
+        <button
+          onClick={() => setSettingsOpen(true)}
+          title="Project settings"
+          aria-label="Project settings"
+          className="sd-hover-border-fg"
+          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer" }}
+        ><SettingsIcon size={14} /></button>
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={() => setThemeMenuOpen((v) => !v)}
+            title="Theme"
+            aria-label="Theme"
+            className="sd-hover-border-fg"
+            style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+          >
+            {theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}
+            <ChevronDown size={12} />
+          </button>
+          {themeMenuOpen && (
+            <>
+              <div onClick={() => setThemeMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 60 }} />
+              <div style={{
+                position: "absolute", right: 0, top: "calc(100% + 6px)", zIndex: 61, minWidth: 140,
+                background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10,
+                boxShadow: "0 10px 34px rgba(var(--shadow-color),.16)", overflow: "hidden", padding: 4,
+              }}>
+                {([{ id: "system" as const, label: "Auto", Icon: Monitor }, { id: "light" as const, label: "Light", Icon: Sun }, { id: "dark" as const, label: "Dark", Icon: Moon }]).map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => { setTheme(t.id); setThemeMenuOpen(false); }}
+                    className="sd-hover-bg"
+                    style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: theme === t.id ? "var(--hover-bg)" : "none", color: theme === t.id ? "var(--text-primary)" : "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+                  ><t.Icon size={13} /> {t.label}</button>
+                ))}
+              </div>
+            </>
+          )}
         </div>
-        <div style={{ width: 26, height: 26, borderRadius: "50%", background: "var(--hover-bg)", border: "1px solid var(--border-strong)", display: "grid", placeItems: "center", fontFamily: MONO, fontSize: 9.5, color: "var(--text-muted)" }}>MR</div>
+        <UserMenu user={user} />
       </div>
+
+      {settingsOpen && <ProjectSettingsModal onClose={() => setSettingsOpen(false)} />}
+      {needsOnboarding && <Onboarding onComplete={() => router.refresh()} />}
 
       <div style={{ position: "absolute", left: 22, bottom: 20, display: "flex", alignItems: "center", gap: 6, zIndex: 20, opacity: isList ? 0 : 1, pointerEvents: isList ? "none" : "auto" }}>
         <div style={{ display: "flex", alignItems: "center", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, overflow: "hidden" }}>
@@ -1045,6 +1206,92 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
           {capture.where && (
             <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)", borderLeft: "1px solid var(--border-subtle)", paddingLeft: 12 }}>{capture.where}</div>
           )}
+        </div>
+      )}
+
+      {contextMenu && contextMenuItem && (
+        <>
+          <div
+            onClick={() => setContextMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setContextMenu(null); }}
+            style={{
+              position: "fixed", inset: 0, zIndex: 60,
+              background: "rgba(0,0,0,.18)",
+              animation: "sd-fade .16s ease-out both",
+            }}
+          />
+          <div style={{
+            position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 63, minWidth: 180, maxWidth: 260,
+            background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10,
+            boxShadow: "0 10px 34px rgba(var(--shadow-color),.16)", overflow: "hidden", padding: 4,
+          }}>
+            <div style={{ padding: "7px 10px", fontSize: 12, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", borderBottom: "1px solid var(--border-subtle)", marginBottom: 4 }}>{contextMenuItem.title}</div>
+            <button
+              onClick={() => { openInEditRef.current = true; setFocusId(contextMenuItem.id); setContextMenu(null); }}
+              className="sd-hover-bg"
+              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+            ><Pencil size={13} /> Edit</button>
+            <button
+              onClick={() => void quickTrash(contextMenuItem.id)}
+              className="sd-hover-bg"
+              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--danger)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+            ><Trash2 size={13} /> Delete</button>
+          </div>
+        </>
+      )}
+
+      {trashOpen && (
+        <div
+          onClick={() => setTrashOpen(false)}
+          style={{
+            position: "absolute", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(2px)", zIndex: 50,
+            display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "7vh 24px 24px", overflowY: "auto",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "min(520px, 100%)", background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 14,
+              boxShadow: "0 24px 70px rgba(var(--shadow-color),.14)", overflow: "hidden", animation: "sd-sheet .24s cubic-bezier(.2,.8,.2,1) both",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "18px 22px", borderBottom: "1px solid var(--border-subtle)" }}>
+              <div style={{ fontFamily: SERIF, fontSize: 19, color: "var(--text-primary)", flex: 1 }}>Trash</div>
+              {trashItems.length > 0 && (
+                <button
+                  onClick={handleEmptyTrash}
+                  style={{
+                    border: `1px solid ${emptyArmed ? "var(--danger)" : "var(--border-strong)"}`,
+                    background: emptyArmed ? "var(--danger-bg)" : "none",
+                    color: emptyArmed ? "var(--danger)" : "var(--text-secondary)",
+                    borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
+                  }}
+                >{emptyArmed ? "Confirm empty?" : "Empty trash"}</button>
+              )}
+            </div>
+            <div style={{ maxHeight: "60vh", overflowY: "auto", padding: "6px 10px" }}>
+              {trashItems.length === 0 ? (
+                <div style={{ padding: "28px 12px", textAlign: "center", fontSize: 13, color: "var(--text-faint)" }}>Nothing in the trash.</div>
+              ) : (
+                trashItems.map((t) => (
+                  <div
+                    key={t.id}
+                    onClick={() => { setFocusId(t.id); setDisc({ highlights: false, related: false, context: false }); setTrashOpen(false); }}
+                    className="sd-hover-bg-alt"
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, cursor: "pointer" }}
+                  >
+                    <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[t.kind] || "var(--text-muted)", flex: "none" }} />
+                    <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleRestore(t); }}
+                      className="sd-hover-border"
+                      style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "4px 10px", fontSize: 12, cursor: "pointer", flex: "none" }}
+                    >Restore</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1144,20 +1391,30 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                     style={{ border: "1px solid var(--border-subtle)", color: "var(--text-fainter)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "not-allowed" }}
                   >Open original ↗</span>
                 )}
-                <button
-                  onClick={() => { setEditing(true); setDeleteArmed(false); }}
-                  className="sd-hover-border"
-                  style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
-                >Edit</button>
-                <button
-                  onClick={() => confirmDelete(focused.id)}
-                  style={{
-                    border: `1px solid ${deleteArmed ? "var(--danger)" : "var(--border-strong)"}`,
-                    background: deleteArmed ? "var(--danger-bg)" : "none",
-                    color: deleteArmed ? "var(--danger)" : "var(--text-secondary)",
-                    borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
-                  }}
-                >{deleteArmed ? "Confirm delete?" : "Delete"}</button>
+                {focusedTrashed ? (
+                  <button
+                    onClick={() => { void handleRestore(focused); setFocusId(null); }}
+                    className="sd-hover-border"
+                    style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
+                  >Restore</button>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => { setEditing(true); setDeleteArmed(false); }}
+                      className="sd-hover-border"
+                      style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
+                    >Edit</button>
+                    <button
+                      onClick={() => confirmDelete(focused.id)}
+                      style={{
+                        border: `1px solid ${deleteArmed ? "var(--danger)" : "var(--border-strong)"}`,
+                        background: deleteArmed ? "var(--danger-bg)" : "none",
+                        color: deleteArmed ? "var(--danger)" : "var(--text-secondary)",
+                        borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
+                      }}
+                    >{deleteArmed ? "Confirm delete?" : "Delete"}</button>
+                  </>
+                )}
               </div>
             )}
 
