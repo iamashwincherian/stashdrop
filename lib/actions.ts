@@ -21,12 +21,44 @@ import {
   getItemsMissingEmbeddings,
   getSearchableItems,
   getItemWithMeta,
+  getItemOwner,
   markEnriched,
   clusterList,
+  addItemComment as addItemCommentDb,
+  listItemComments as listItemCommentsDb,
   type ItemEdits,
+  type ItemComment,
 } from "./db";
 import { CLUSTERS, type StashItem } from "./data";
-import { requireStashId } from "./session";
+import { requireStashId, requireSession, requireRole } from "./session";
+
+// Every action that touches an existing item funnels through here first —
+// the single place that enforces "this item belongs to the workspace I'm
+// currently in." requireStashId() already re-verifies the caller is still
+// a member of their active organization on every call (see
+// resolveActiveOrg in db.ts), so a removed member's stash resolves back to
+// their personal one — this then makes sure the specific item they're
+// trying to touch is actually inside that resolved stash, not some other
+// workspace's. Without it, an item id alone would be enough to reach
+// across workspaces, membership check or not.
+async function requireItemInCurrentStash(id: string): Promise<{ createdBy: string | null; stashId: string }> {
+  const stashId = await requireStashId();
+  const owner = getItemOwner(id);
+  if (!owner || owner.stashId !== stashId) throw new Error("Not found");
+  return owner;
+}
+
+// A "user" may only remove what they created; admin/owner may remove
+// anything in the workspace. Items with no known creator (seed data,
+// anything captured before this existed) are admin/owner-only.
+async function requireCanDelete(id: string) {
+  const owner = await requireItemInCurrentStash(id);
+  const session = await requireSession();
+  if (owner.createdBy === session.user.id) return;
+  const role = await requireRole();
+  if (role === "owner" || role === "admin") return;
+  throw new Error("You can only delete bookmarks you added");
+}
 
 export type KeepResult = { item: StashItem; clusterName: string } | { duplicate: StashItem };
 
@@ -66,6 +98,7 @@ async function linkRelated(id: string, vector: number[], stashId: string): Promi
 // notices that patch and applies it wherever the item currently lives.
 export async function keepUrl(rawUrl: string): Promise<KeepResult> {
   const stashId = await requireStashId();
+  const session = await requireSession();
 
   let meta: Awaited<ReturnType<typeof fetchPageMeta>>;
   try {
@@ -95,9 +128,10 @@ export async function keepUrl(rawUrl: string): Promise<KeepResult> {
     description: meta.description, tags: [], highlights: [], note: "", related: [],
     context: "Saved just now, not sorted by hand yet.",
     url: meta.url, image: meta.image ?? undefined,
+    createdById: session.user.id, createdByName: session.user.name,
   };
 
-  insertItem(item, "This week", Date.now(), stashId);
+  insertItem(item, "This week", Date.now(), stashId, session.user.id);
   void enrichItemInBackground(item.id, meta, stashId);
 
   return { item, clusterName: CLUSTERS[cluster]?.name || "Unsorted" };
@@ -138,43 +172,50 @@ async function enrichItemInBackground(id: string, meta: { title: string; domain:
 // landing and patch whatever's currently showing this item — pending
 // panel, held ghost, or already-placed card.
 export async function getItem(id: string): Promise<{ item: StashItem; enrichedAt: number | null } | null> {
+  await requireItemInCurrentStash(id);
   return getItemWithMeta(id);
 }
 
 export async function savePosition(id: string, x: number, y: number) {
+  await requireItemInCurrentStash(id);
   savePositionDb(id, x, y);
 }
 
 // A freeform sticky note — unlike kept links, it isn't AI-classified or
 // filed into a pile (cluster stays empty so it doesn't distort any pile's
 // bounding box); it just floats wherever it was dropped.
-export async function addComment(text: string, author: string, x: number, y: number): Promise<StashItem> {
+// Dropped blank — the ghost-comment flow places it first and lets the
+// user type the title straight into the card; the author is whoever's
+// signed in, not a name they type themselves.
+export async function addComment(x: number, y: number): Promise<StashItem> {
   const stashId = await requireStashId();
-  const body = text.trim().slice(0, 500);
+  const session = await requireSession();
   const item: StashItem = {
     id: "c" + randomUUID().slice(0, 8),
     kind: "comment", cluster: "", x, y, w: 200,
-    title: author.trim().slice(0, 60) || "Anonymous",
-    domain: "comment",
+    title: "",
+    domain: session.user.name || "Anonymous",
     kept: "just now",
-    isText: true, body,
+    isText: true, body: "",
     description: "", tags: [], highlights: [], note: "", related: [], context: "",
+    createdById: session.user.id, createdByName: session.user.name,
   };
-  insertItem(item, "This week", Date.now(), stashId);
-  const vector = await embedText(`search_document: ${body}`);
-  if (vector) setEmbedding(item.id, vector);
+  insertItem(item, "This week", Date.now(), stashId, session.user.id);
   return item;
 }
 
 export async function deleteItem(id: string) {
+  await requireCanDelete(id);
   deleteItemDb(id);
 }
 
 export async function trashItem(id: string) {
+  await requireCanDelete(id);
   trashItemDb(id);
 }
 
 export async function restoreItem(id: string) {
+  await requireItemInCurrentStash(id);
   restoreItemDb(id);
 }
 
@@ -187,6 +228,7 @@ export async function listTrash(): Promise<(StashItem & { deletedAt: number })[]
 }
 
 export async function updateItemFields(id: string, edits: ItemEdits): Promise<StashItem | null> {
+  await requireItemInCurrentStash(id);
   const updated = updateItemDb(id, edits);
   if (!updated) return null;
   const vector = await embedText(embeddingText(updated));
@@ -229,6 +271,22 @@ export async function searchItems(query: string): Promise<SearchHit[]> {
     .filter((r) => r.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+}
+
+// Discussion thread on a bookmark — distinct from the "comment" item kind
+// above (a sticky note on the canvas). Any workspace member can post; no
+// delete/edit yet, this is discussion, not a moderated log.
+export async function addItemComment(itemId: string, body: string): Promise<ItemComment> {
+  const trimmed = body.trim();
+  if (!trimmed) throw new Error("Comment can't be empty");
+  await requireItemInCurrentStash(itemId);
+  const session = await requireSession();
+  return addItemCommentDb(itemId, session.user.id, trimmed);
+}
+
+export async function listItemComments(itemId: string): Promise<ItemComment[]> {
+  await requireItemInCurrentStash(itemId);
+  return listItemCommentsDb(itemId);
 }
 
 async function backfillEmbeddings() {

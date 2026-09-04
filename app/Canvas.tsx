@@ -12,10 +12,13 @@ import {
   type StashItem,
   type Kind,
 } from "@/lib/data";
-import { keepUrl, getItem, savePosition, deleteItem, trashItem, restoreItem, emptyTrash, listTrash, updateItemFields, searchItems, addComment, type SearchHit, type KeepResult } from "@/lib/actions";
-import { Trash2, Sun, Moon, Monitor, Pencil, ChevronDown, Settings as SettingsIcon } from "lucide-react";
+import { keepUrl, getItem, savePosition, deleteItem, trashItem, restoreItem, emptyTrash, listTrash, updateItemFields, searchItems, addComment, addItemComment, listItemComments, type SearchHit, type KeepResult } from "@/lib/actions";
+import type { ItemComment } from "@/lib/db";
+import { Trash2, Sun, Moon, Monitor, Pencil, ChevronDown, Settings as SettingsIcon, Building2, User as UserIcon, Send } from "lucide-react";
+import { authClient } from "@/lib/auth-client";
 import Onboarding from "./Onboarding";
 import ProjectSettingsModal from "./ProjectSettingsModal";
+import WorkspaceSwitcher from "./WorkspaceSwitcher";
 import UserMenu from "./UserMenu";
 
 const PAPER = "var(--paper)";
@@ -27,7 +30,6 @@ const DEFAULT_CAMERA = { scale: 0.78, tx: -104, ty: 2 };
 const KIND_OPTIONS: Kind[] = ["article", "video", "image", "pdf", "note", "quote", "repo", "shot"];
 type Theme = "light" | "dark" | "system";
 const THEME_KEY = "stashdrop-theme";
-const COMMENT_AUTHOR_KEY = "stashdrop-comment-author";
 
 interface Capture {
   text: string;
@@ -37,7 +39,7 @@ interface Capture {
 }
 
 interface Disc {
-  key: "highlights" | "related" | "context";
+  key: "highlights" | "related" | "context" | "comments";
   label: string;
   n: string;
 }
@@ -64,11 +66,19 @@ interface CanvasProps {
   initialItems: StashItem[];
   initialBucket: Record<string, string>;
   initialRecentOrder: string[];
-  user: { name: string; email: string };
+  user: { id: string; name: string; email: string };
+  project: { name: string; description: string } | null;
+  workspace: { name: string; organizationId: string | null };
+  role: string;
   needsOnboarding: boolean;
+  // When the user is mid-onboarding for a workspace they just switched to,
+  // the "Personal or team" choice is already made — Onboarding skips it and
+  // goes straight to naming the first stash under this scope/team.
+  onboardingInitialScope?: "user" | "organization";
+  onboardingOrganizationId?: string;
 }
 
-export default function Canvas({ initialItems, initialBucket, initialRecentOrder, user, needsOnboarding }: CanvasProps) {
+export default function Canvas({ initialItems, initialBucket, initialRecentOrder, user, project, workspace, role, needsOnboarding, onboardingInitialScope, onboardingOrganizationId }: CanvasProps) {
   const router = useRouter();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -104,6 +114,14 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     dragId: null as string | null, panning: false, scale: DEFAULT_CAMERA.scale,
     aiming: false, lastCursor: [0, 0] as [number, number],
     pending: null as PendingCapture | null, ghost: null as GhostCapture | null,
+    placingComment: false,
+    // placeGhost/placeComment clear their own "is a ghost pending" flag
+    // synchronously (before their first await), which happens before the
+    // click event that follows the same pointerdown even fires — so a
+    // click's own "is a ghost mid-drop" check always sees false and can't
+    // tell a drop-click from an open-this-card click. This flag is set at
+    // the moment a drop is committed and consumed by the very next click.
+    suppressClick: false,
   });
 
   const setCamera = useCallback((updater: typeof DEFAULT_CAMERA | ((s: typeof DEFAULT_CAMERA) => typeof DEFAULT_CAMERA)) => {
@@ -136,7 +154,12 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [searchResults, setSearchResults] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [brokenImages, setBrokenImages] = useState<Set<string>>(new Set());
-  const [disc, setDisc] = useState({ highlights: false, related: false, context: false });
+  const [disc, setDisc] = useState({ highlights: false, related: false, context: false, comments: false });
+  const [comments, setComments] = useState<ItemComment[]>([]);
+  const [commentsItemId, setCommentsItemId] = useState<string | null>(null);
+  const [newComment, setNewComment] = useState("");
+  const [postingComment, setPostingComment] = useState(false);
+  const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   const [capture, setCapture] = useState<Capture | null>(null);
 
   const [pendingState, setPendingState] = useState<PendingCapture | null>(null);
@@ -160,7 +183,9 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const thumbRef = useRef<HTMLDivElement>(null);
   const cancelledPidsRef = useRef<Set<string>>(new Set());
 
-  const [theme, setThemeState] = useState<Theme>("system");
+  // "light" is the true default (matches layout.tsx's before-paint script) —
+  // "system" is only ever active once a user explicitly picks Auto.
+  const [theme, setThemeState] = useState<Theme>("light");
   useEffect(() => {
     // localStorage is a browser-only API — this component is also
     // server-rendered, so this can't be a lazy useState initializer and has
@@ -170,46 +195,79 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     try {
       const stored = localStorage.getItem(THEME_KEY);
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      if (stored === "light" || stored === "dark") setThemeState(stored);
-    } catch { /* localStorage unavailable (private mode, etc.) — stay on system */ }
+      if (stored === "light" || stored === "dark" || stored === "system") setThemeState(stored);
+    } catch { /* localStorage unavailable (private mode, etc.) — stay on light */ }
   }, []);
   const setTheme = useCallback((t: Theme) => {
     setThemeState(t);
     try {
-      if (t === "system") localStorage.removeItem(THEME_KEY);
-      else localStorage.setItem(THEME_KEY, t);
+      localStorage.setItem(THEME_KEY, t);
     } catch { /* ignore */ }
     if (t === "system") document.documentElement.removeAttribute("data-theme");
     else document.documentElement.setAttribute("data-theme", t);
   }, []);
 
-  const [composingComment, setComposingComment] = useState(false);
-  const [commentAuthor, setCommentAuthor] = useState("");
-  const [commentText, setCommentText] = useState("");
+  // Surfaces a just-received team invite as the workspace switcher, once
+  // per browser session per invite (onboarding handles invites on its own
+  // for brand-new accounts, so this only matters for already-onboarded
+  // users who get invited later).
   useEffect(() => {
-    // Same story as the theme effect above — localStorage only exists
-    // client-side, so this has to be a post-mount effect, not render logic.
-    try {
-      const saved = localStorage.getItem(COMMENT_AUTHOR_KEY);
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      if (saved) setCommentAuthor(saved);
-    } catch { /* ignore */ }
+    if (needsOnboarding) return;
+    void authClient.organization.listUserInvitations().then(({ data }) => {
+      const pending = (data || []).filter((i) => i.status === "pending");
+      if (!pending.length) return;
+      const key = "stashdrop-invites-seen";
+      let seen: string[] = [];
+      try { seen = JSON.parse(sessionStorage.getItem(key) || "[]"); } catch { /* private mode etc. */ }
+      if (pending.every((i) => seen.includes(i.id))) return;
+      try { sessionStorage.setItem(key, JSON.stringify(pending.map((i) => i.id))); } catch { /* ignore */ }
+      setWorkspaceSwitcherOpen(true);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function submitComment() {
-    const text = commentText.trim();
-    if (!text) return;
-    try { localStorage.setItem(COMMENT_AUTHOR_KEY, commentAuthor.trim()); } catch { /* ignore */ }
-    // drop it at the current viewport center, in canvas space
-    const cx = (window.innerWidth / 2 - camera.tx) / camera.scale;
-    const cy = (window.innerHeight / 2 - camera.ty) / camera.scale;
-    const item = await addComment(text, commentAuthor, cx, cy);
+  // Dropping a comment works like the paste-to-keep ghost: click "+
+  // Comment", a blank sticky note follows the cursor, click the desk to
+  // place it — then it's immediately live for typing, no name prompt (the
+  // author is whoever's signed in).
+  const [placingComment, setPlacingCommentState] = useState(false);
+  const [autoFocusCommentId, setAutoFocusCommentId] = useState<string | null>(null);
+  function setPlacingComment(v: boolean) {
+    liveRef.current.placingComment = v;
+    setPlacingCommentState(v);
+  }
+
+  function beginPlacingComment() {
+    if (placingComment) { setPlacingComment(false); liveRef.current.aiming = false; return; }
+    const target = liveRef.current.lastCursor[0] || liveRef.current.lastCursor[1]
+      ? liveRef.current.lastCursor
+      : ([window.innerWidth / 2 - 100, window.innerHeight / 2 - 60] as [number, number]);
+    setCursor(target);
+    liveRef.current.aiming = true;
+    setPlacingComment(true);
+  }
+
+  async function placeComment(clientX: number, clientY: number) {
+    setPlacingComment(false);
+    liveRef.current.aiming = false;
+    const x = (clientX - camera.tx) / camera.scale - 100;
+    const y = (clientY - camera.ty) / camera.scale - 60;
+    const item = await addComment(x, y);
     setItems((prev) => [...prev, item]);
     setBucket((prev) => ({ ...prev, [item.id]: "This week" }));
     setRecentOrder((prev) => [item.id, ...prev]);
     setPos((prev) => ({ ...prev, [item.id]: [item.x, item.y] }));
-    setCommentText("");
-    setComposingComment(false);
+    setLandedId(item.id);
+    later(() => setLandedId((prev) => (prev === item.id ? null : prev)), 700);
+    setAutoFocusCommentId(item.id); // the title input focuses itself once rendered, see the card map below
+  }
+
+  async function commitCommentTitle(id: string, title: string) {
+    const trimmed = title.trim();
+    const current = items.find((o) => o.id === id);
+    if (!current || current.title === trimmed) return;
+    const updated = await updateItemFields(id, { title: trimmed });
+    if (updated) setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
   }
 
   const [editing, setEditing] = useState(false);
@@ -280,8 +338,10 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
           if (p.item) void deleteItem(p.item.id);
         }
         liveRef.current.aiming = false;
+        liveRef.current.placingComment = false;
         setPending(null);
         setGhost(null);
+        setPlacingCommentState(false);
         setFocusId(null);
         setTrashOpen(false);
         setContextMenu(null);
@@ -509,7 +569,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       if (pendingState?.status === "ready") { startPlacing(); return; }
       if (searchResults.length) {
         setFocusId(searchResults[0].id);
-        setDisc({ highlights: false, related: false, context: false });
+        setDisc({ highlights: false, related: false, context: false, comments: false });
       }
     }
   }
@@ -532,7 +592,9 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       later(() => setDeleteArmed(false), 4000);
       return;
     }
-    await trashItem(id);
+    try {
+      await trashItem(id);
+    } catch { setDeleteArmed(false); return; }
     setItems((prev) => prev.filter((o) => o.id !== id));
     setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
     setFocusId(null);
@@ -541,10 +603,25 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   async function quickTrash(id: string) {
     setContextMenu(null);
-    await trashItem(id);
+    try {
+      await trashItem(id);
+    } catch { return; }
     setItems((prev) => prev.filter((o) => o.id !== id));
     setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
     setFocusId((f) => (f === id ? null : f));
+  }
+
+  async function postComment(itemId: string) {
+    const body = newComment.trim();
+    if (!body) return;
+    setPostingComment(true);
+    try {
+      const comment = await addItemComment(itemId, body);
+      setComments((prev) => [...prev, comment]);
+      setNewComment("");
+    } finally {
+      setPostingComment(false);
+    }
   }
 
   async function openTrash() {
@@ -587,7 +664,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       .map((rid) => {
         const r = items.find((o) => o.id === rid);
         if (!r) return null;
-        return { id: rid, title: r.title, mark: MARK[r.kind], why: WHY_RELATED[rid] || "related" };
+        return { id: rid, title: r.title, mark: MARK[r.kind], why: WHY_RELATED[rid] || WHY_RELATED[rid.replace(/^demo-/, "")] || "related" };
       })
       .filter((r): r is NonNullable<typeof r> => r !== null)
     : [];
@@ -598,9 +675,15 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         { key: "highlights" as const, label: "Highlights & notes", n: String(focused.highlights.length + (focused.note ? 1 : 0)) },
         { key: "related" as const, label: "Related", n: String(focused.related.length) },
         { key: "context" as const, label: "Why it is here", n: "" },
+        { key: "comments" as const, label: "Comments", n: commentsItemId === focused.id ? String(comments.length) : "" },
       ].filter((d) => d.key !== "highlights" || focused.highlights.length > 0 || !!focused.note)
     )
     : [];
+
+  const canDeleteItem = useCallback((item: StashItem) => {
+    if (item.createdById && item.createdById === user.id) return true;
+    return role === "owner" || role === "admin";
+  }, [role, user.id]);
 
   let listGroups: { name: string; n: string; items: StashItem[] }[] = [];
   if (sort === "pile") {
@@ -631,7 +714,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   function rowSub(o: StashItem, hit: number | null, hovered: boolean) {
     if (hit != null) return matchLabel(hit);
-    if (hovered) return WHY[o.id] || o.domain;
+    if (hovered) return WHY[o.id] || WHY[o.id.replace(/^demo-/, "")] || o.domain;
     return o.domain;
   }
 
@@ -647,6 +730,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         ref={canvasRef}
         onPointerDown={(e) => {
           if (liveRef.current.ghost) { placeGhost(e.clientX, e.clientY); return; }
+          if (liveRef.current.placingComment) { void placeComment(e.clientX, e.clientY); return; }
           startPan(); setFocusId(null);
         }}
         style={{
@@ -667,8 +751,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               else) but has no pointer handlers at all, so it can't be
               dragged or clicked like the item cards — a fixed landmark. */}
           <div style={{ position: "absolute", left: 750, top: 140, pointerEvents: "none", userSelect: "none" }}>
-            <div style={{ fontFamily: SERIF, fontSize: 46, letterSpacing: "-.01em", color: "var(--text-primary)", whiteSpace: "nowrap" }}>Stashdrop</div>
-            <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)", marginTop: 4 }}>everything you&apos;ve kept, in one place</div>
+            <div style={{ fontFamily: SERIF, fontSize: 46, letterSpacing: "-.01em", color: "var(--text-primary)", whiteSpace: "nowrap" }}>{project?.name || "Stashdrop"}</div>
+            <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)", marginTop: 4 }}>{project?.description || "everything you've kept, in one place"}</div>
           </div>
 
           {items.map((o) => {
@@ -727,12 +811,14 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 key={o.id}
                 onPointerDown={(e) => {
                   e.stopPropagation();
-                  if (liveRef.current.ghost) { placeGhost(e.clientX, e.clientY); return; }
+                  if (liveRef.current.ghost) { liveRef.current.suppressClick = true; placeGhost(e.clientX, e.clientY); return; }
+                  if (liveRef.current.placingComment) { liveRef.current.suppressClick = true; void placeComment(e.clientX, e.clientY); return; }
                   startDrag(o.id);
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (!liveRef.current.ghost && dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false }); }
+                  if (liveRef.current.suppressClick) { liveRef.current.suppressClick = false; return; }
+                  if (dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
@@ -771,13 +857,47 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
                 {isText && (
                   <div style={{ padding: "16px 17px 5px" }}>
-                    <div style={{ fontFamily: SERIF, fontStyle: o.kind === "quote" ? "italic" : "normal", fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.body}</div>
+                    {o.kind === "comment" ? (
+                      autoFocusCommentId === o.id ? (
+                        // A native <input>, scaled down with the rest of the
+                        // canvas (camera.scale below 100%), renders its text
+                        // as a blurry rasterized replaced-element — unlike
+                        // plain text, which stays crisp under a CSS
+                        // transform. So the input only exists while this
+                        // card is actively being typed into; once it blurs,
+                        // the text below takes over for crisp display, and
+                        // clicking it re-enters edit mode.
+                        <input
+                          defaultValue={o.title}
+                          placeholder="Write a comment…"
+                          ref={(el) => { if (el) el.focus(); }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                          onBlur={(e) => { void commitCommentTitle(o.id, e.target.value); setAutoFocusCommentId(null); }}
+                          style={{ width: "100%", border: "none", outline: "none", background: "none", fontFamily: SERIF, fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)" }}
+                        />
+                      ) : (
+                        <div
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); setAutoFocusCommentId(o.id); }}
+                          style={{
+                            fontFamily: SERIF, fontSize: 19, lineHeight: 1.3, minHeight: "1.3em", cursor: "text",
+                            color: o.title ? "var(--text-secondary)" : "var(--text-faint)", textWrap: "pretty" as CSSProperties["textWrap"],
+                          }}
+                        >{o.title || "Write a comment…"}</div>
+                      )
+                    ) : (
+                      <div style={{ fontFamily: SERIF, fontStyle: o.kind === "quote" ? "italic" : "normal", fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.body}</div>
+                    )}
                   </div>
                 )}
 
                 <div style={{ padding: isText ? "5px 17px 16px" : "14px 16px 15px" }}>
-                  <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", opacity: titleOp, textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.title}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 6, opacity: titleOp }}>
+                  {o.kind !== "comment" && (
+                    <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", opacity: titleOp, textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.title}</div>
+                  )}
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: o.kind === "comment" ? 0 : 6, opacity: titleOp }}>
                     <span style={{ width: 10, height: 10, borderRadius: 2, background: MARK[o.kind] || "var(--text-muted)", flex: "none" }} />
                     <span style={{ fontFamily: MONO, fontSize: 10.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.domain}</span>
                   </div>
@@ -820,7 +940,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   return (
                     <div
                       key={r.id}
-                      onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false }); }}
+                      onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
                       onMouseEnter={() => setHoverId(r.id)}
                       onMouseLeave={() => setHoverId((h) => (h === r.id ? null : h))}
                       style={{
@@ -851,14 +971,41 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         </div>
       )}
 
+      {/* Glass strip the top bar's controls sit on — blurs whatever's
+          scrolled underneath rather than each button floating on its own
+          hard-edged pill. Masked to fade out at the bottom instead of
+          ending in a hard line. */}
+      <div
+        style={{
+          position: "absolute", inset: "0 0 auto 0", height: 92, zIndex: 15, pointerEvents: "none",
+          backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
+          background: "linear-gradient(to bottom, rgba(var(--shadow-color),.05), rgba(var(--shadow-color),0))",
+          maskImage: "linear-gradient(to bottom, black 0%, black 55%, transparent 100%)",
+          WebkitMaskImage: "linear-gradient(to bottom, black 0%, black 55%, transparent 100%)",
+        }}
+      />
+
       <div style={{ position: "absolute", left: 22, top: 20, display: "flex", alignItems: "center", gap: 11, zIndex: 20 }}>
         <div style={{ width: 15, height: 15, borderRadius: 4, background: "var(--text-primary)", position: "relative" }}>
           <div style={{ position: "absolute", right: -4, bottom: -4, width: 9, height: 9, borderRadius: 3, background: PAPER, border: "1px solid var(--text-primary)" }} />
         </div>
         <div style={{ fontFamily: MONO, fontSize: 10.5, letterSpacing: ".2em", textTransform: "uppercase", color: "var(--text-muted)" }}>Stashdrop</div>
+        <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, padding: 2, marginLeft: 6 }}>
+          {[{ id: "desk" as const, label: "Desk" }, { id: "list" as const, label: "List" }].map((v) => (
+            <button
+              key={v.id}
+              onClick={() => {
+                if (v.id === "list") { setView("list"); setFocusId(null); }
+                else { setView("desk"); setCamera(DEFAULT_CAMERA); setFocusId(null); }
+              }}
+              className="sd-hover-fg"
+              style={{ border: "none", background: view === v.id ? "var(--hover-bg)" : "transparent", color: view === v.id ? "var(--text-primary)" : "var(--text-muted)", borderRadius: 6, padding: "6px 13px", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
+            >{v.label}</button>
+          ))}
+        </div>
       </div>
 
-      <div style={{ position: "absolute", left: "50%", top: 16, transform: "translateX(-50%)", width: "min(560px, calc(100vw - 260px))", zIndex: 30 }}>
+      <div style={{ position: "absolute", left: "50%", top: 16, transform: "translateX(-50%)", width: "min(560px, calc(100vw - 540px))", zIndex: 30 }}>
         <div style={{
           background: "var(--surface)", backdropFilter: "blur(12px)",
           border: `1px solid ${barOpen ? "var(--border-strong)" : "var(--border-default)"}`,
@@ -899,7 +1046,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 return (
                   <button
                     key={hit.id}
-                    onClick={() => { setFocusId(hit.id); setDisc({ highlights: false, related: false, context: false }); }}
+                    onClick={() => { setFocusId(hit.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
                     className="sd-hover-bg-alt"
                     style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", border: "none", background: "none", borderRadius: 7, padding: "8px 10px", cursor: "pointer" }}
                   >
@@ -1075,30 +1222,17 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       })()}
 
       <div style={{ position: "absolute", right: 22, top: 18, display: "flex", alignItems: "center", gap: 7, zIndex: 20 }}>
-        <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, padding: 2 }}>
-          {[{ id: "desk" as const, label: "Desk" }, { id: "list" as const, label: "List" }].map((v) => (
-            <button
-              key={v.id}
-              onClick={() => {
-                if (v.id === "list") { setView("list"); setFocusId(null); }
-                else { setView("desk"); setCamera(DEFAULT_CAMERA); setFocusId(null); }
-              }}
-              className="sd-hover-fg"
-              style={{ border: "none", background: view === v.id ? "var(--hover-bg)" : "transparent", color: view === v.id ? "var(--text-primary)" : "var(--text-muted)", borderRadius: 6, padding: "6px 13px", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
-            >{v.label}</button>
-          ))}
-        </div>
         <button
-          onClick={openTrash}
-          title="Trash"
-          aria-label="Trash"
+          onClick={() => setWorkspaceSwitcherOpen(true)}
+          title="Switch workspace"
+          aria-label="Switch workspace"
           className="sd-hover-border-fg"
-          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer" }}
-        ><Trash2 size={14} /></button>
+          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12.5 }}
+        >{workspace.organizationId ? <Building2 size={14} /> : <UserIcon size={14} />} {workspace.name}</button>
         <button
           onClick={() => setSettingsOpen(true)}
-          title="Project settings"
-          aria-label="Project settings"
+          title="Stash settings"
+          aria-label="Stash settings"
           className="sd-hover-border-fg"
           style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer" }}
         ><SettingsIcon size={14} /></button>
@@ -1133,11 +1267,12 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             </>
           )}
         </div>
-        <UserMenu user={user} />
+        <UserMenu user={user} onSwitchWorkspace={() => setWorkspaceSwitcherOpen(true)} />
       </div>
 
       {settingsOpen && <ProjectSettingsModal onClose={() => setSettingsOpen(false)} />}
-      {needsOnboarding && <Onboarding onComplete={() => router.refresh()} />}
+      {workspaceSwitcherOpen && <WorkspaceSwitcher currentOrganizationId={workspace.organizationId} onClose={() => setWorkspaceSwitcherOpen(false)} />}
+      {needsOnboarding && <Onboarding onComplete={() => router.refresh()} initialScope={onboardingInitialScope} organizationId={onboardingOrganizationId} />}
 
       <div style={{ position: "absolute", left: 22, bottom: 20, display: "flex", alignItems: "center", gap: 6, zIndex: 20, opacity: isList ? 0 : 1, pointerEvents: isList ? "none" : "auto" }}>
         <div style={{ display: "flex", alignItems: "center", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, overflow: "hidden" }}>
@@ -1148,52 +1283,43 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-fainter)", paddingLeft: 6 }}>drag things around · scroll to zoom</div>
       </div>
 
-      <div style={{ position: "absolute", right: 22, bottom: 20, zIndex: 30 }}>
-        {composingComment && (
-          <div style={{
-            position: "absolute", right: 0, bottom: 44, width: 260,
-            background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10,
-            boxShadow: "0 14px 40px rgba(var(--shadow-color),.16)", padding: 12, display: "flex", flexDirection: "column", gap: 8,
-          }}>
-            <input
-              value={commentAuthor}
-              onChange={(e) => setCommentAuthor(e.target.value)}
-              placeholder="Your name"
-              style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "6px 9px", fontSize: 12.5, color: "var(--text-primary)", background: "var(--card-bg)" }}
-            />
-            <textarea
-              value={commentText}
-              onChange={(e) => setCommentText(e.target.value)}
-              placeholder="Leave a comment on the board…"
-              rows={3}
-              autoFocus
-              style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "6px 9px", fontSize: 12.5, color: "var(--text-primary)", background: "var(--card-bg)", resize: "vertical", fontFamily: SANS }}
-            />
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button
-                onClick={() => setComposingComment(false)}
-                className="sd-hover-border"
-                style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
-              >Cancel</button>
-              <button
-                onClick={submitComment}
-                disabled={!commentText.trim()}
-                style={{ border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: commentText.trim() ? "pointer" : "not-allowed", opacity: commentText.trim() ? 1 : 0.5 }}
-              >Drop it</button>
-            </div>
-          </div>
-        )}
+      <div style={{ position: "absolute", right: 22, bottom: 20, zIndex: 30, display: "flex", alignItems: "center", gap: 7 }}>
         <button
-          onClick={() => setComposingComment((v) => !v)}
+          onClick={openTrash}
+          title="Trash"
+          aria-label="Trash"
+          className="sd-hover-border-fg"
+          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer", boxShadow: "0 2px 10px rgba(var(--shadow-color),.05)" }}
+        ><Trash2 size={14} /></button>
+        <button
+          onClick={beginPlacingComment}
           className="sd-hover-bg"
-          title="Drop a comment on the board"
+          title={placingComment ? "Click the desk to drop it (Esc to cancel)" : "Drop a comment on the board"}
           style={{
-            display: "flex", alignItems: "center", gap: 7, border: "1px solid var(--border-default)",
-            background: "var(--surface)", color: "var(--text-secondary)", borderRadius: 8, padding: "8px 13px",
+            display: "flex", alignItems: "center", gap: 7,
+            border: `1px solid ${placingComment ? "var(--text-primary)" : "var(--border-default)"}`,
+            background: placingComment ? "var(--hover-bg)" : "var(--surface)", color: "var(--text-secondary)", borderRadius: 8, padding: "8px 13px",
             fontSize: 12.5, cursor: "pointer", boxShadow: "0 2px 10px rgba(var(--shadow-color),.05)",
           }}
-        ><span style={{ width: 9, height: 9, borderRadius: 2, background: MARK.comment, flex: "none" }} />+ Comment</button>
+        ><span style={{ width: 9, height: 9, borderRadius: 2, background: MARK.comment, flex: "none" }} />{placingComment ? "Click the desk…" : "+ Comment"}</button>
       </div>
+
+      {placingComment && (
+        <div style={{
+          position: "fixed", left: cursor[0] + 16, top: cursor[1] + 14, width: 200, zIndex: 45, pointerEvents: "none",
+          transform: `scale(${camera.scale}) rotate(-1.5deg)`, transformOrigin: "0 0", opacity: 0.94,
+          background: "var(--sticky-bg)", border: "1px solid var(--sticky-border)", borderRadius: 11, overflow: "hidden",
+          boxShadow: "0 22px 48px rgba(var(--shadow-color),.22)",
+        }}>
+          <div style={{ padding: "16px 17px 5px" }}>
+            <div style={{ fontFamily: SERIF, fontSize: 19, color: "var(--text-faint)" }}>Write a comment…</div>
+          </div>
+          <div style={{ padding: "5px 17px 16px", display: "flex", alignItems: "center", gap: 7 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: MARK.comment, flex: "none" }} />
+            <span style={{ fontFamily: MONO, fontSize: 10.5, color: "var(--text-faint)" }}>{user.name}</span>
+          </div>
+        </div>
+      )}
 
       {capture && (
         <div style={{
@@ -1231,11 +1357,13 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               className="sd-hover-bg"
               style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
             ><Pencil size={13} /> Edit</button>
-            <button
-              onClick={() => void quickTrash(contextMenuItem.id)}
-              className="sd-hover-bg"
-              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--danger)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
-            ><Trash2 size={13} /> Delete</button>
+            {canDeleteItem(contextMenuItem) && (
+              <button
+                onClick={() => void quickTrash(contextMenuItem.id)}
+                className="sd-hover-bg"
+                style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--danger)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+              ><Trash2 size={13} /> Delete</button>
+            )}
           </div>
         </>
       )}
@@ -1276,7 +1404,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 trashItems.map((t) => (
                   <div
                     key={t.id}
-                    onClick={() => { setFocusId(t.id); setDisc({ highlights: false, related: false, context: false }); setTrashOpen(false); }}
+                    onClick={() => { setFocusId(t.id); setDisc({ highlights: false, related: false, context: false, comments: false }); setTrashOpen(false); }}
                     className="sd-hover-bg-alt"
                     style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, cursor: "pointer" }}
                   >
@@ -1311,7 +1439,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             }}
           >
             <div style={{
-              height: focused.isText ? 200 : (focused.kind === "image" || focused.kind === "shot" ? 300 : 220),
+              height: focused.kind === "comment" ? 60 : focused.isText ? 200 : (focused.kind === "image" || focused.kind === "shot" ? 300 : 220),
               background: focused.kind === "comment" ? "var(--sticky-bg)" : TINT[focused.kind] || "var(--tint-article)", borderBottom: "1px solid var(--border-subtle)", position: "relative", display: "grid", placeItems: "center", overflow: "hidden",
             }}>
               {!focused.isText && focused.image && !brokenImages.has(focused.id) ? (
@@ -1331,7 +1459,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   }} />
                 ))
               )}
-              {focused.isText && (
+              {focused.isText && focused.kind !== "comment" && (
                 <div style={{ padding: "34px 40px", maxWidth: 520 }}>
                   <div style={{ fontFamily: SERIF, fontStyle: focused.kind === "quote" ? "italic" : "normal", fontSize: 26, lineHeight: 1.28, color: "var(--text-primary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.body}</div>
                 </div>
@@ -1362,6 +1490,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
               <div style={{ display: "flex", alignItems: "center", gap: 9, fontFamily: MONO, fontSize: 10, color: "var(--text-faint)", flexWrap: "wrap" }}>
                 <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[focused.kind] || "var(--text-muted)" }} />
                 <span>{focused.domain}</span><span>·</span><span>kept {focused.kept}</span><span>·</span><span>{(CLUSTERS[focused.cluster] || { name: "Unsorted" }).name}</span>
+                {focused.createdByName && <><span>·</span><span>added by {focused.createdByName}</span></>}
               </div>
             </div>
 
@@ -1404,15 +1533,17 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                       className="sd-hover-border"
                       style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
                     >Edit</button>
-                    <button
-                      onClick={() => confirmDelete(focused.id)}
-                      style={{
-                        border: `1px solid ${deleteArmed ? "var(--danger)" : "var(--border-strong)"}`,
-                        background: deleteArmed ? "var(--danger-bg)" : "none",
-                        color: deleteArmed ? "var(--danger)" : "var(--text-secondary)",
-                        borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
-                      }}
-                    >{deleteArmed ? "Confirm delete?" : "Delete"}</button>
+                    {canDeleteItem(focused) && (
+                      <button
+                        onClick={() => confirmDelete(focused.id)}
+                        style={{
+                          border: `1px solid ${deleteArmed ? "var(--danger)" : "var(--border-strong)"}`,
+                          background: deleteArmed ? "var(--danger-bg)" : "none",
+                          color: deleteArmed ? "var(--danger)" : "var(--text-secondary)",
+                          borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
+                        }}
+                      >{deleteArmed ? "Confirm delete?" : "Delete"}</button>
+                    )}
                   </>
                 )}
               </div>
@@ -1421,7 +1552,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             {editing && focused.kind === "comment" && (
               <div style={{ padding: "14px 26px 0", display: "flex", flexDirection: "column", gap: 10 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
-                  Name
+                  Title
                   <input
                     value={editTitle}
                     onChange={(e) => setEditTitle(e.target.value)}
@@ -1429,11 +1560,12 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   />
                 </label>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
-                  Comment
+                  Description
                   <textarea
-                    value={editBody}
-                    onChange={(e) => setEditBody(e.target.value)}
+                    value={editDescription}
+                    onChange={(e) => setEditDescription(e.target.value)}
                     rows={4}
+                    placeholder="Room for the whole paragraph, if the title isn't enough."
                     style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", resize: "vertical", fontFamily: SANS }}
                   />
                 </label>
@@ -1531,7 +1663,13 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 return (
                   <div key={d.key} style={{ borderTop: "1px solid var(--border-subtle)" }}>
                     <button
-                      onClick={() => setDisc((prev) => ({ ...prev, [d.key]: !prev[d.key] }))}
+                      onClick={() => {
+                        setDisc((prev) => ({ ...prev, [d.key]: !prev[d.key] }));
+                        if (d.key === "comments" && commentsItemId !== focused.id) {
+                          setCommentsItemId(focused.id);
+                          void listItemComments(focused.id).then(setComments);
+                        }
+                      }}
                       style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", border: "none", background: "none", padding: "13px 2px", cursor: "pointer" }}
                     >
                       <span style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: "var(--text-muted)", flex: 1 }}>{d.label}</span>
@@ -1558,7 +1696,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                             {focusedRelated.map((r) => (
                               <div
                                 key={r.id}
-                                onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false }); }}
+                                onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
                                 className="sd-hover-bg-alt"
                                 style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 8px", borderRadius: 8, cursor: "pointer" }}
                               >
@@ -1577,6 +1715,34 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                               className="sd-hover-border"
                               style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}
                             >{isList ? "Show it on the desk" : "Find it in the list"}</button>
+                          </div>
+                        )}
+                        {d.key === "comments" && (
+                          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                            {comments.map((c) => (
+                              <div key={c.id}>
+                                <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                                  <span style={{ fontSize: 12.5, fontWeight: 500, color: "var(--text-primary)" }}>{c.userName}</span>
+                                  <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)" }}>{new Date(c.createdAt).toLocaleString()}</span>
+                                </div>
+                                <div style={{ fontSize: 13.5, color: "var(--text-secondary)", marginTop: 3, lineHeight: 1.5, textWrap: "pretty" as CSSProperties["textWrap"] }}>{c.body}</div>
+                              </div>
+                            ))}
+                            {comments.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No comments yet.</div>}
+                            <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                              <input
+                                value={newComment}
+                                onChange={(e) => setNewComment(e.target.value)}
+                                placeholder="Add a comment…"
+                                onKeyDown={(e) => { if (e.key === "Enter") postComment(focused.id); }}
+                                style={{ flex: 1, border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13, color: "var(--text-primary)", background: "var(--card-bg)" }}
+                              />
+                              <button
+                                onClick={() => postComment(focused.id)}
+                                disabled={postingComment || !newComment.trim()}
+                                style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "0 11px", cursor: "pointer", display: "flex", alignItems: "center", opacity: !newComment.trim() ? 0.5 : 1 }}
+                              ><Send size={13} /></button>
+                            </div>
                           </div>
                         )}
                       </div>

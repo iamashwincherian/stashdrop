@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Settings, LogOut } from "lucide-react";
+import { Settings, LogOut, Building2 } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 
 const SERIF = "var(--font-serif), serif";
@@ -15,7 +15,7 @@ function initials(name: string) {
   return (parts[0][0] + (parts[1]?.[0] || "")).toUpperCase();
 }
 
-export default function UserMenu({ user }: { user: { name: string; email: string } }) {
+export default function UserMenu({ user, onSwitchWorkspace }: { user: { name: string; email: string }; onSwitchWorkspace: () => void }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -62,6 +62,11 @@ export default function UserMenu({ user }: { user: { name: string; email: string
               <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div>
               <div style={{ fontSize: 11.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{user.email}</div>
             </div>
+            <button
+              onClick={() => { onSwitchWorkspace(); setOpen(false); }}
+              className="sd-hover-bg"
+              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+            ><Building2 size={13} /> Switch workspace</button>
             <button
               onClick={() => { setAccountOpen(true); setOpen(false); }}
               className="sd-hover-bg"

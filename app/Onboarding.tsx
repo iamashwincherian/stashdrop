@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
-import { Building2, User, Check } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Building2, User, Check, Mail } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import { completeOnboarding } from "@/lib/workspace-actions";
+import { createTeamAndProject, acceptInvite } from "@/lib/workspace-client";
 
 const SERIF = "var(--font-serif), serif";
 const SANS = "var(--font-sans), system-ui, sans-serif";
@@ -15,39 +16,64 @@ const inputStyle: React.CSSProperties = {
   fontFamily: SANS, outline: "none",
 };
 
-function slugify(s: string) {
-  return s.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "team";
+interface PendingInvite { id: string; organizationId: string; organizationName: string }
+
+interface OnboardingProps {
+  onComplete: () => void;
+  // When set, the workspace is already decided (the user just switched to
+  // it) — the "Personal or team" step is skipped and only the first stash
+  // name is needed. organizationId is the pre-existing team to create the
+  // stash under when initialScope is "organization" (otherwise a brand-new
+  // team is created from the team-name field in step 0).
+  initialScope?: "user" | "organization";
+  organizationId?: string;
 }
 
-export default function Onboarding({ onComplete }: { onComplete: () => void }) {
+export default function Onboarding({ onComplete, initialScope, organizationId }: OnboardingProps) {
   const [step, setStep] = useState(0);
-  const [stashName, setStashName] = useState("First stash");
-  const [scope, setScope] = useState<"user" | "organization" | null>(null);
+  const [scope, setScope] = useState<"user" | "organization" | null>(initialScope ?? null);
   const [teamName, setTeamName] = useState("");
-  const [projectName, setProjectName] = useState("My project");
-  const [projectDescription, setProjectDescription] = useState("");
+  const [stashName, setStashName] = useState("First stash");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const steps = ["Name your stash", "Personal or team", "Create a project"];
+  const [invites, setInvites] = useState<PendingInvite[]>([]);
+  useEffect(() => {
+    void authClient.organization.listUserInvitations().then(({ data }) => {
+      if (!data) return;
+      setInvites(data.filter((i) => i.status === "pending").map((i) => ({ id: i.id, organizationId: i.organizationId, organizationName: i.organizationName ?? "a team" })));
+    });
+  }, []);
+
+  const steps = initialScope ? ["Name your first stash"] : ["Personal or team", "Name your first stash"];
+
+  async function joinInvite(invite: PendingInvite) {
+    setBusy(true);
+    setError(null);
+    try {
+      await acceptInvite(invite.id, invite.organizationId);
+      onComplete();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't join that team.");
+      setBusy(false);
+    }
+  }
 
   async function finish() {
     setBusy(true);
     setError(null);
     try {
-      let organizationId: string | undefined;
       if (scope === "organization") {
-        const { data, error: orgErr } = await authClient.organization.create({ name: teamName.trim() || "My team", slug: slugify(teamName) });
-        if (orgErr) throw new Error(orgErr.message || "Couldn't create team.");
-        organizationId = data?.id;
+        if (organizationId) {
+          // Switching into an existing team — reuse it instead of creating
+          // another one.
+          await completeOnboarding({ scope: "organization", organizationId, projectName: stashName.trim() || "First stash", projectDescription: "", stashName });
+        } else {
+          await createTeamAndProject({ teamName, stashName });
+        }
+      } else {
+        await completeOnboarding({ scope: "user", projectName: stashName.trim() || "First stash", projectDescription: "", stashName });
       }
-      await completeOnboarding({
-        scope: scope!,
-        organizationId,
-        projectName,
-        projectDescription,
-        stashName,
-      });
       onComplete();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");
@@ -56,9 +82,11 @@ export default function Onboarding({ onComplete }: { onComplete: () => void }) {
   }
 
   const canContinue =
-    step === 0 ? stashName.trim().length > 0 :
-    step === 1 ? scope === "user" || (scope === "organization" && teamName.trim().length > 0) :
-    projectName.trim().length > 0;
+    step === 0
+      ? initialScope
+        ? scope !== null
+        : scope === "user" || (scope === "organization" && teamName.trim().length > 0)
+      : stashName.trim().length > 0;
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(6px)", zIndex: 100, display: "grid", placeItems: "center", padding: 20 }}>
@@ -71,22 +99,32 @@ export default function Onboarding({ onComplete }: { onComplete: () => void }) {
             <div key={i} style={{ height: 3, flex: 1, borderRadius: 2, background: i <= step ? "var(--text-primary)" : "var(--border-default)" }} />
           ))}
         </div>
-        <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "var(--text-faint)", marginBottom: 6 }}>
-          Step {step + 1} of {steps.length}
-        </div>
-        <div style={{ fontFamily: SERIF, fontSize: 24, color: "var(--text-primary)", marginBottom: 20 }}>{steps[step]}</div>
-
-        {step === 0 && (
-          <div>
-            <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 12 }}>
-              A stash is your board — everything you keep lives here. You can make more later.
-            </div>
-            <input value={stashName} onChange={(e) => setStashName(e.target.value)} placeholder="First stash" style={inputStyle} autoFocus />
+        {steps.length > 1 && (
+          <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "var(--text-faint)", marginBottom: 6 }}>
+            Step {step + 1} of {steps.length}
           </div>
         )}
+        <div style={{ fontFamily: SERIF, fontSize: 24, color: "var(--text-primary)", marginBottom: 20 }}>{steps[step]}</div>
 
-        {step === 1 && (
+        {!initialScope && step === 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {invites.map((invite) => (
+              <button
+                key={invite.id}
+                onClick={() => joinInvite(invite)}
+                disabled={busy}
+                style={{
+                  display: "flex", alignItems: "center", gap: 12, textAlign: "left", cursor: busy ? "default" : "pointer",
+                  border: "1px solid var(--accent-border)", background: "var(--accent-bg)", borderRadius: 10, padding: "13px 14px",
+                }}
+              >
+                <Mail size={18} color="var(--text-secondary)" />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14, fontWeight: 500, color: "var(--text-primary)" }}>Join {invite.organizationName}</div>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 1 }}>You&apos;ve been invited to this team.</div>
+                </div>
+              </button>
+            ))}
             {([
               { id: "user" as const, label: "Personal", desc: "Just for you.", Icon: User },
               { id: "organization" as const, label: "Team", desc: "Create a team to share it with others.", Icon: Building2 },
@@ -114,14 +152,12 @@ export default function Onboarding({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
 
-        {step === 2 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <input value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="Project name" style={inputStyle} autoFocus />
-            <textarea
-              value={projectDescription} onChange={(e) => setProjectDescription(e.target.value)}
-              placeholder="What's this project for? (optional)" rows={3}
-              style={{ ...inputStyle, resize: "vertical" }}
-            />
+        {step === steps.length - 1 && (
+          <div>
+            <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 12 }}>
+              A stash is your board — everything you keep lives here. You can make more later.
+            </div>
+            <input value={stashName} onChange={(e) => setStashName(e.target.value)} placeholder="First stash" style={inputStyle} autoFocus />
           </div>
         )}
 
@@ -137,14 +173,14 @@ export default function Onboarding({ onComplete }: { onComplete: () => void }) {
             }}
           >Back</button>
           <button
-            onClick={() => (step < 2 ? setStep((s) => s + 1) : finish())}
+            onClick={() => (step < steps.length - 1 ? setStep((s) => s + 1) : finish())}
             disabled={!canContinue || busy}
             style={{
               border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)",
               borderRadius: 8, padding: "9px 18px", fontSize: 13.5, fontWeight: 500,
               cursor: canContinue && !busy ? "pointer" : "not-allowed", opacity: canContinue && !busy ? 1 : 0.45,
             }}
-          >{busy ? "Setting up…" : step < 2 ? "Continue" : "Start stashing"}</button>
+          >{busy ? "Setting up…" : step < steps.length - 1 ? "Continue" : "Start stashing"}</button>
         </div>
       </div>
     </div>

@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS stashes (
   name TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS item_comments (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 
 // columns added after the initial release; ensured present on every boot so
@@ -62,6 +70,7 @@ const MIGRATIONS: [column: string, def: string][] = [
   ["deleted_at", "INTEGER"],
   ["enriched_at", "INTEGER"],
   ["stash_id", "TEXT"],
+  ["created_by", "TEXT"],
 ];
 
 interface Row {
@@ -71,7 +80,7 @@ interface Row {
   highlights: string; note: string; related: string; context: string;
   created_at: number; seed_order: number; url: string | null; image: string | null;
   embedding: string | null; deleted_at: number | null; enriched_at: number | null;
-  stash_id: string | null;
+  stash_id: string | null; created_by: string | null; created_by_name: string | null;
 }
 
 // Seed items carry curated, fixed narrative dates ("12 Jan", "yesterday")
@@ -105,6 +114,7 @@ function rowToItem(r: Row): StashItem {
     description: r.description, tags: JSON.parse(r.tags), highlights: JSON.parse(r.highlights),
     note: r.note, related: JSON.parse(r.related), context: r.context,
     url: r.url ?? undefined, image: r.image ?? undefined,
+    createdById: r.created_by ?? undefined, createdByName: r.created_by_name ?? undefined,
   };
 }
 
@@ -115,42 +125,77 @@ function ensureColumn(db: DatabaseSync, column: string, def: string) {
   }
 }
 
-function seedIfEmpty(db: DatabaseSync) {
-  const { n } = db.prepare("SELECT COUNT(*) as n FROM items").get() as { n: number };
-  if (n > 0) return;
-  const insert = db.prepare(`
-    INSERT INTO items (id,kind,cluster,x,y,w,title,domain,kept,bucket,is_text,body,playhead,description,tags,highlights,note,related,context,created_at,seed_order)
-    VALUES (@id,@kind,@cluster,@x,@y,@w,@title,@domain,@kept,@bucket,@is_text,@body,@playhead,@description,@tags,@highlights,@note,@related,@context,@created_at,@seed_order)
-  `);
-  const now = Date.now();
-  OBJ.forEach((o, i) => {
-    insert.run({
-      id: o.id, kind: o.kind, cluster: o.cluster, x: o.x, y: o.y, w: o.w,
-      title: o.title, domain: o.domain, kept: o.kept, bucket: BUCKET[o.id] || "This week",
-      is_text: o.isText ? 1 : 0, body: o.body ?? null, playhead: o.playhead ? 1 : 0,
-      description: o.description, tags: JSON.stringify(o.tags), highlights: JSON.stringify(o.highlights),
-      note: o.note, related: JSON.stringify(o.related), context: o.context,
-      created_at: now - (RECENT.indexOf(o.id) < 0 ? RECENT.length : RECENT.indexOf(o.id)) * 3_600_000,
-      seed_order: i,
-    });
-  });
-}
-
 export function getDb(): DatabaseSync {
   if (!globalThis.__stashdropDb) {
     const db = new DatabaseSync(path.join(process.cwd(), "stashdrop.db"));
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec(SCHEMA);
     MIGRATIONS.forEach(([column, def]) => ensureColumn(db, column, def));
-    seedIfEmpty(db);
     globalThis.__stashdropDb = db;
   }
   return globalThis.__stashdropDb;
 }
 
+export const DEMO_EMAIL = "ashwincherian.spam+demo@gmail.com";
+export const DEMO_PASSWORD = "demo1234";
+
+// Seeds a real, signed-in-able demo account (personal workspace, one
+// project/stash, the same sample bookmarks the app used to seed as
+// unowned rows) — runs once, after better-auth's own tables exist (see
+// the call site in auth.ts), guarded by the demo user already existing so
+// it never re-seeds or duplicates on later boots.
+export async function seedDemoWorkspace() {
+  const db = getDb();
+  const existing = db.prepare("SELECT id FROM user WHERE email = ?").get(DEMO_EMAIL) as { id: string } | undefined;
+  if (existing) return;
+
+  const { hashPassword } = await import("better-auth/crypto");
+  const hashedPassword = await hashPassword(DEMO_PASSWORD);
+  const userId = randomUUID();
+  const now = new Date().toISOString();
+
+  // Transactional so a failure partway (e.g. an id collision) never leaves
+  // a half-seeded demo user stuck behind the "already exists" guard above
+  // with no stash to show for it — either the whole thing lands, or none
+  // of it does and the next boot retries cleanly.
+  db.exec("BEGIN");
+  try {
+    db.prepare("INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES (?, ?, ?, 1, ?, ?)")
+      .run(userId, "Demo", DEMO_EMAIL, now, now);
+    db.prepare("INSERT INTO account (id, issuer, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, 'credential', ?, ?, ?, ?)")
+      .run(randomUUID(), "local:credential", userId, userId, hashedPassword, now, now);
+
+    const project = createProject("Demo stash", "", "user", userId);
+    const stash = createStash(project.id, "Demo stash");
+
+    // Prefixed so these ids can never collide with a real captured item's
+    // id (or, on an install that upgraded from the old unowned-seed-rows
+    // scheme, with leftover rows already sitting in someone's real stash)
+    // — items.id is a global primary key, not scoped per stash.
+    // WHY/WHY_RELATED in lib/data.ts are still keyed by the bare original
+    // id, so Canvas.tsx strips this prefix back off before looking those up.
+    const createdAt = Date.now();
+    OBJ.forEach((o) => {
+      const item: StashItem = {
+        id: "demo-" + o.id, kind: o.kind, cluster: o.cluster, x: o.x, y: o.y, w: o.w,
+        title: o.title, domain: o.domain, kept: o.kept, isText: o.isText, body: o.body,
+        playhead: o.playhead, description: o.description, tags: o.tags, highlights: o.highlights,
+        note: o.note, related: o.related.map((r) => "demo-" + r), context: o.context,
+      };
+      insertItem(item, BUCKET[o.id] || "This week", createdAt - (RECENT.indexOf(o.id) < 0 ? RECENT.length : RECENT.indexOf(o.id)) * 3_600_000, stash.id, userId);
+    });
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
 export function getAllItemsWithMeta(stashId: string) {
   const db = getDb();
-  const items = (db.prepare("SELECT * FROM items WHERE stash_id = ? AND deleted_at IS NULL ORDER BY seed_order ASC").all(stashId) as unknown as Row[]).map(rowToItem);
+  const items = (db.prepare(
+    "SELECT items.*, user.name AS created_by_name FROM items LEFT JOIN user ON user.id = items.created_by WHERE items.stash_id = ? AND items.deleted_at IS NULL ORDER BY items.seed_order ASC"
+  ).all(stashId) as unknown as Row[]).map(rowToItem);
   const bucket: Record<string, string> = {};
   (db.prepare("SELECT id, bucket, url, created_at FROM items WHERE stash_id = ? AND deleted_at IS NULL").all(stashId) as { id: string; bucket: string; url: string | null; created_at: number }[]).forEach((r) => {
     bucket[r.id] = r.url ? relativeBucket(r.created_at) : r.bucket;
@@ -239,7 +284,9 @@ export function updateItem(id: string, edits: ItemEdits): StashItem | null {
     db.prepare("UPDATE items SET x = ?, y = ? WHERE id = ?").run(x, y, id);
   }
 
-  return rowToItem(db.prepare("SELECT * FROM items WHERE id = ?").get(id) as unknown as Row);
+  return rowToItem(db.prepare(
+    "SELECT items.*, user.name AS created_by_name FROM items LEFT JOIN user ON user.id = items.created_by WHERE items.id = ?"
+  ).get(id) as unknown as Row);
 }
 
 export function setEmbedding(id: string, embedding: number[]) {
@@ -302,12 +349,12 @@ export function nextPositionForCluster(cluster: string, stashId: string): { x: n
   return { x: left, y };
 }
 
-export function insertItem(item: StashItem, bucket: string, createdAt: number, stashId: string) {
+export function insertItem(item: StashItem, bucket: string, createdAt: number, stashId: string, createdBy: string) {
   const db = getDb();
   const { n } = db.prepare("SELECT COALESCE(MAX(seed_order), 0) + 1 as n FROM items").get() as { n: number };
   db.prepare(`
-    INSERT INTO items (id,kind,cluster,x,y,w,title,domain,kept,bucket,is_text,body,playhead,description,tags,highlights,note,related,context,created_at,seed_order,url,image,stash_id)
-    VALUES (@id,@kind,@cluster,@x,@y,@w,@title,@domain,@kept,@bucket,@is_text,@body,@playhead,@description,@tags,@highlights,@note,@related,@context,@created_at,@seed_order,@url,@image,@stash_id)
+    INSERT INTO items (id,kind,cluster,x,y,w,title,domain,kept,bucket,is_text,body,playhead,description,tags,highlights,note,related,context,created_at,seed_order,url,image,stash_id,created_by)
+    VALUES (@id,@kind,@cluster,@x,@y,@w,@title,@domain,@kept,@bucket,@is_text,@body,@playhead,@description,@tags,@highlights,@note,@related,@context,@created_at,@seed_order,@url,@image,@stash_id,@created_by)
   `).run({
     id: item.id, kind: item.kind, cluster: item.cluster, x: item.x, y: item.y, w: item.w,
     title: item.title, domain: item.domain, kept: item.kept, bucket,
@@ -315,7 +362,7 @@ export function insertItem(item: StashItem, bucket: string, createdAt: number, s
     description: item.description, tags: JSON.stringify(item.tags), highlights: JSON.stringify(item.highlights),
     note: item.note, related: JSON.stringify(item.related), context: item.context,
     created_at: createdAt, seed_order: n,
-    url: item.url ?? null, image: item.image ?? null, stash_id: stashId,
+    url: item.url ?? null, image: item.image ?? null, stash_id: stashId, created_by: createdBy,
   } satisfies Record<string, unknown>);
 }
 
@@ -362,18 +409,131 @@ export function createStash(projectId: string, name: string): Stash {
   const id = randomUUID();
   const createdAt = Date.now();
   db.prepare("INSERT INTO stashes (id, project_id, name, created_at) VALUES (?, ?, ?, ?)").run(id, projectId, name, createdAt);
-
-  // ponytail: the very first stash this install ever creates claims all
-  // pre-auth demo items (stash_id still NULL) so the first person to sign
-  // up doesn't land on an empty canvas. Every stash after that starts empty
-  // — a real "duplicate/import a stash" flow would replace this.
-  const { n } = db.prepare("SELECT COUNT(*) as n FROM stashes").get() as { n: number };
-  if (n === 1) db.prepare("UPDATE items SET stash_id = ? WHERE stash_id IS NULL").run(id);
-
   return { id, projectId, name, createdAt };
 }
 
 export function getStash(id: string): Stash | null {
   const row = getDb().prepare("SELECT * FROM stashes WHERE id = ?").get(id) as unknown as StashRow | undefined;
   return row ? rowToStash(row) : null;
+}
+
+// The "current stash" for a signed-in user, resolved fresh from the DB
+// every time — never trust a client-held id for this (a cookie set by one
+// account and left in the browser would silently hand its data to whoever
+// logs in next). `activeOrganizationId` is better-auth's own pointer for
+// which workspace a session currently has selected (see session.ts) — null
+// means the user's personal workspace. A non-null value is only ever
+// trusted after re-checking membership right here: setActiveOrganization
+// verified it at the time it was set, but that pointer sits in a
+// long-lived session and membership can be revoked afterward (removed from
+// a team) — every caller of this function is, in effect, re-running that
+// check on every request, which is what actually keeps a removed member
+// from still reading (or writing to) a team's stash. Falls back to the
+// personal workspace exactly as if no org had ever been made active. Picks
+// the earliest-created stash if a workspace somehow has more than one — no
+// multi-project-per-workspace UI exists yet, so "first" is "the" project.
+export function getStashForWorkspace(userId: string, activeOrganizationId: string | null): Stash | null {
+  const db = getDb();
+  const orgId = resolveActiveOrg(userId, activeOrganizationId);
+  const project = orgId
+    ? db.prepare(
+        "SELECT * FROM projects WHERE owner_type = 'organization' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
+      ).get(orgId) as unknown as ProjectRow | undefined
+    : db.prepare(
+        "SELECT * FROM projects WHERE owner_type = 'user' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
+      ).get(userId) as unknown as ProjectRow | undefined;
+  if (!project) return null;
+
+  const row = db.prepare("SELECT * FROM stashes WHERE project_id = ? ORDER BY created_at ASC LIMIT 1").get(project.id) as unknown as StashRow | undefined;
+  return row ? rowToStash(row) : null;
+}
+
+// A workspace's owner/admin/member role for permission checks (deleting
+// someone else's bookmark, deleting the project, managing members) —
+// queried straight from better-auth's own `member` table, same pattern the
+// org join above used to use. Null for a personal workspace (no `member`
+// row exists there — the caller is always its sole, full owner).
+export function getOrgRole(organizationId: string, userId: string): string | null {
+  const row = getDb().prepare("SELECT role FROM member WHERE organizationId = ? AND userId = ?").get(organizationId, userId) as { role: string } | undefined;
+  return row?.role ?? null;
+}
+
+export function getOrgName(organizationId: string): string | null {
+  const row = getDb().prepare("SELECT name FROM organization WHERE id = ?").get(organizationId) as { name: string } | undefined;
+  return row?.name ?? null;
+}
+
+// The single choke point every route/action resolves a session's active
+// organization through — a session's activeOrganizationId is only trusted
+// if the user is still, right now, a member of that org. Anywhere this
+// returns null is treated exactly like the personal workspace was active
+// all along, which is what actually stops a removed member from still
+// reading (or writing to) a team's stash after the fact.
+export function resolveActiveOrg(userId: string, activeOrganizationId: string | null): string | null {
+  return activeOrganizationId && getOrgRole(activeOrganizationId, userId) ? activeOrganizationId : null;
+}
+
+// True when the user already has at least one workspace anywhere (a personal
+// project, or membership in an org that has a project). Tells a brand-new
+// sign-up — who still needs the full "Personal or team" onboarding choice —
+// apart from an existing user switching into a workspace that has no stash
+// yet, where the workspace is already decided and only the stash name is
+// needed.
+export function hasAnyWorkspace(userId: string): boolean {
+  const db = getDb();
+  if (db.prepare("SELECT 1 FROM projects WHERE owner_type = 'user' AND owner_id = ? LIMIT 1").get(userId)) return true;
+  return !!db.prepare(
+    "SELECT 1 FROM projects p JOIN member m ON m.organizationId = p.owner_id WHERE p.owner_type = 'organization' AND m.userId = ? LIMIT 1"
+  ).get(userId);
+}
+
+export function getFirstProjectForOrg(organizationId: string): Project | null {
+  const row = getDb().prepare(
+    "SELECT * FROM projects WHERE owner_type = 'organization' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
+  ).get(organizationId) as unknown as ProjectRow | undefined;
+  return row ? rowToProject(row) : null;
+}
+
+export function getFirstStashForProject(projectId: string): Stash | null {
+  const row = getDb().prepare("SELECT * FROM stashes WHERE project_id = ? ORDER BY created_at ASC LIMIT 1").get(projectId) as unknown as StashRow | undefined;
+  return row ? rowToStash(row) : null;
+}
+
+export function getItemOwner(id: string): { createdBy: string | null; stashId: string } | null {
+  const row = getDb().prepare("SELECT created_by, stash_id FROM items WHERE id = ?").get(id) as { created_by: string | null; stash_id: string } | undefined;
+  return row ? { createdBy: row.created_by, stashId: row.stash_id } : null;
+}
+
+// Deletes a project, its stashes, and everything in them — used when an
+// owner deletes a project. The app has no notion of a zero-project
+// workspace, so callers immediately create a fresh replacement project
+// afterward (see deleteProject in workspace-actions.ts).
+export function deleteProjectCascade(projectId: string) {
+  const db = getDb();
+  const stashIds = (db.prepare("SELECT id FROM stashes WHERE project_id = ?").all(projectId) as { id: string }[]).map((r) => r.id);
+  for (const stashId of stashIds) {
+    db.prepare("DELETE FROM item_comments WHERE item_id IN (SELECT id FROM items WHERE stash_id = ?)").run(stashId);
+    db.prepare("DELETE FROM items WHERE stash_id = ?").run(stashId);
+  }
+  db.prepare("DELETE FROM stashes WHERE project_id = ?").run(projectId);
+  db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+}
+
+export interface ItemComment { id: string; itemId: string; userId: string; userName: string; body: string; createdAt: number }
+
+export function addItemComment(itemId: string, userId: string, body: string): ItemComment {
+  const id = randomUUID();
+  const createdAt = Date.now();
+  getDb().prepare("INSERT INTO item_comments (id, item_id, user_id, body, created_at) VALUES (?, ?, ?, ?, ?)").run(id, itemId, userId, body, createdAt);
+  const user = getDb().prepare("SELECT name FROM user WHERE id = ?").get(userId) as { name: string } | undefined;
+  return { id, itemId, userId, userName: user?.name ?? "Someone", body, createdAt };
+}
+
+export function listItemComments(itemId: string): ItemComment[] {
+  const rows = getDb().prepare(`
+    SELECT item_comments.id, item_comments.item_id, item_comments.user_id, item_comments.body, item_comments.created_at, user.name AS user_name
+    FROM item_comments JOIN user ON user.id = item_comments.user_id
+    WHERE item_comments.item_id = ? ORDER BY item_comments.created_at ASC
+  `).all(itemId) as { id: string; item_id: string; user_id: string; body: string; created_at: number; user_name: string }[];
+  return rows.map((r) => ({ id: r.id, itemId: r.item_id, userId: r.user_id, userName: r.user_name, body: r.body, createdAt: r.created_at }));
 }

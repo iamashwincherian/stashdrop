@@ -5,11 +5,14 @@ import "./globals.css";
 
 const THEME_KEY = "stashdrop-theme";
 // Runs before hydration so the page never flashes the wrong theme on load.
+// Default (nothing stored yet) is light — only an explicit "dark" choice, or
+// an explicit "system" choice on a dark OS, should ever produce dark mode.
 const setThemeBeforePaint = `
 (function() {
   try {
     var t = localStorage.getItem("${THEME_KEY}");
-    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    if (t === "dark") document.documentElement.setAttribute("data-theme", "dark");
+    else if (t !== "system") document.documentElement.setAttribute("data-theme", "light");
   } catch (e) {}
 })();
 `;

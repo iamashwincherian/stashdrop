@@ -21,6 +21,8 @@ export interface StashItem {
   context: string;
   url?: string;
   image?: string;
+  createdById?: string;
+  createdByName?: string;
 }
 
 export interface Bar {
