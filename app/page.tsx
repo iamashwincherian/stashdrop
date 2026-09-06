@@ -1,8 +1,9 @@
 import { redirect } from "next/navigation";
 import Canvas from "./Canvas";
-import { getAllItemsWithMeta, getStashForWorkspace, getProject, getOrgRole, getOrgName, resolveActiveOrg, hasAnyWorkspace } from "@/lib/db";
+import { getAllItemsWithMeta, getStashForWorkspace, getOrgRole, getOrgName, resolveActiveOrg, hasAnyWorkspace, listStashesForOwner, getClusters } from "@/lib/db";
 import { auth } from "@/lib/auth";
-import { headers } from "next/headers";
+import { headers, cookies } from "next/headers";
+import { ACTIVE_STASH_COOKIE } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +19,8 @@ export default async function Page() {
 
   const user = { id: session.user.id, name: session.user.name, email: session.user.email };
 
-  const stash = getStashForWorkspace(session.user.id, orgId);
+  const preferredStashId = (await cookies()).get(ACTIVE_STASH_COOKIE)?.value ?? null;
+  const stash = getStashForWorkspace(session.user.id, orgId, preferredStashId);
   if (!stash) {
     // Signed in but never finished onboarding (no project/stash yet) —
     // Canvas renders the onboarding wizard instead of the desk in this case.
@@ -34,7 +36,6 @@ export default async function Page() {
         initialBucket={{}}
         initialRecentOrder={[]}
         user={user}
-        project={null}
         workspace={workspace}
         role={role}
         needsOnboarding
@@ -44,8 +45,9 @@ export default async function Page() {
     );
   }
 
-  const project = getProject(stash.projectId);
   const { items, bucket, recentOrder } = getAllItemsWithMeta(stash.id);
+  const stashes = listStashesForOwner(stash.ownerType, stash.ownerId).map((s) => ({ id: s.id, name: s.name }));
+  const clusters = getClusters(stash.id);
   return (
     <Canvas
       // Canvas keeps items/positions/etc. in local state, seeded once from
@@ -60,10 +62,12 @@ export default async function Page() {
       initialBucket={bucket}
       initialRecentOrder={recentOrder}
       user={user}
-      project={project ? { name: project.name, description: project.description } : null}
       workspace={workspace}
       role={role}
       needsOnboarding={false}
+      stash={{ id: stash.id, name: stash.name, description: stash.description }}
+      stashes={stashes}
+      clusters={clusters}
     />
   );
 }

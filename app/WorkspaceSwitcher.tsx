@@ -4,20 +4,13 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Building2, User, Check, Mail, Plus } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
-import { acceptInvite, declineInvite, createTeamAndProject } from "@/lib/workspace-client";
-
-const SERIF = "var(--font-serif), serif";
-const SANS = "var(--font-sans), system-ui, sans-serif";
-const MONO = "var(--font-mono), monospace";
+import { acceptInvite, declineInvite, createTeamAndStash } from "@/lib/workspace-client";
 
 interface Org { id: string; name: string }
 interface Invite { id: string; organizationId: string; organizationName: string }
 
-const rowStyle = (active: boolean): React.CSSProperties => ({
-  display: "flex", alignItems: "center", gap: 12, textAlign: "left", cursor: "pointer", width: "100%",
-  border: `1px solid ${active ? "var(--text-primary)" : "var(--border-default)"}`,
-  background: active ? "var(--accent-bg)" : "var(--card-bg)", borderRadius: 10, padding: "11px 13px",
-});
+const rowClass = (active: boolean): string =>
+  `flex w-full cursor-pointer items-center gap-3 rounded-[10px] border px-[13px] py-[11px] text-left ${active ? "border-primary bg-accent-bg" : "border-default bg-card"}`;
 
 export default function WorkspaceSwitcher({ currentOrganizationId, onClose }: { currentOrganizationId: string | null; onClose: () => void }) {
   const router = useRouter();
@@ -81,7 +74,7 @@ export default function WorkspaceSwitcher({ currentOrganizationId, onClose }: { 
     setBusy(true);
     setError(null);
     try {
-      await createTeamAndProject({ teamName, stashName });
+      await createTeamAndStash({ teamName, stashName });
       onClose();
       router.refresh();
     } catch (e) {
@@ -91,73 +84,69 @@ export default function WorkspaceSwitcher({ currentOrganizationId, onClose }: { 
   }
 
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(4px)", zIndex: 80, display: "grid", placeItems: "center", padding: 20 }}>
+    <div onClick={onClose} className="fixed inset-0 z-80 grid place-items-center bg-overlay p-5 backdrop-blur-[4px]">
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{
-          width: "min(400px, 100%)", background: "var(--surface-solid)", border: "1px solid var(--border-default)", borderRadius: 14,
-          boxShadow: "0 24px 60px rgba(var(--shadow-color),.16)", padding: "22px 22px 20px", animation: "sd-sheet .22s cubic-bezier(.2,.8,.2,1) both",
-        }}
+        className="w-[min(400px,100%)] animate-sheet rounded-[14px] border border-default bg-surface-solid px-[22px] pb-5 pt-[22px] shadow-[0_24px_60px_rgba(var(--shadow-color),.16)]"
       >
-        <div style={{ fontFamily: SERIF, fontSize: 20, color: "var(--text-primary)", marginBottom: 16 }}>Switch workspace</div>
+        <div className="mb-4 font-serif text-[20px] text-primary">Switch workspace</div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <button onClick={selectPersonal} disabled={busy} style={rowStyle(currentOrganizationId === null)}>
-            <User size={16} color="var(--text-secondary)" />
-            <span style={{ flex: 1, fontSize: 13.5, color: "var(--text-primary)" }}>Personal</span>
-            {currentOrganizationId === null && <Check size={15} color="var(--text-primary)" />}
+        <div className="flex flex-col gap-2">
+          <button onClick={selectPersonal} disabled={busy} className={rowClass(currentOrganizationId === null)}>
+            <User size={16} className="text-secondary" />
+            <span className="flex-1 text-[13.5px] text-primary">Personal</span>
+            {currentOrganizationId === null && <Check size={15} className="text-primary" />}
           </button>
-          {orgs === null && <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 2px" }}>Loading…</div>}
+          {orgs === null && <div className="px-0.5 py-1 text-xs text-faint">Loading…</div>}
           {orgs?.map((o) => (
-            <button key={o.id} onClick={() => selectOrg(o.id)} disabled={busy} style={rowStyle(currentOrganizationId === o.id)}>
-              <Building2 size={16} color="var(--text-secondary)" />
-              <span style={{ flex: 1, fontSize: 13.5, color: "var(--text-primary)" }}>{o.name}</span>
-              {currentOrganizationId === o.id && <Check size={15} color="var(--text-primary)" />}
+            <button key={o.id} onClick={() => selectOrg(o.id)} disabled={busy} className={rowClass(currentOrganizationId === o.id)}>
+              <Building2 size={16} className="text-secondary" />
+              <span className="flex-1 text-[13.5px] text-primary">{o.name}</span>
+              {currentOrganizationId === o.id && <Check size={15} className="text-primary" />}
             </button>
           ))}
         </div>
 
         {invites.length > 0 && (
-          <div style={{ marginTop: 16, borderTop: "1px solid var(--border-subtle)", paddingTop: 14 }}>
-            <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)", marginBottom: 8 }}>Pending invites</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div className="mt-4 border-t border-subtle pt-3.5">
+            <div className="mb-2 font-mono text-[10px] uppercase tracking-[.08em] text-faint">Pending invites</div>
+            <div className="flex flex-col gap-2">
               {invites.map((invite) => (
-                <div key={invite.id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid var(--accent-border)", background: "var(--accent-bg)", borderRadius: 10, padding: "10px 12px" }}>
-                  <Mail size={15} color="var(--text-secondary)" />
-                  <span style={{ flex: 1, fontSize: 13, color: "var(--text-primary)" }}>{invite.organizationName}</span>
-                  <button onClick={() => accept(invite)} disabled={busy} style={{ border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)", borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }}>Accept</button>
-                  <button onClick={() => decline(invite)} disabled={busy} style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }}>Decline</button>
+                <div key={invite.id} className="flex items-center gap-2.5 rounded-[10px] border border-accent-border bg-accent-bg px-3 py-2.5">
+                  <Mail size={15} className="text-secondary" />
+                  <span className="flex-1 text-[13px] text-primary">{invite.organizationName}</span>
+                  <button onClick={() => accept(invite)} disabled={busy} className="cursor-pointer rounded-md border border-primary bg-primary px-2.5 py-1 text-xs text-card">Accept</button>
+                  <button onClick={() => decline(invite)} disabled={busy} className="cursor-pointer rounded-md border border-strong bg-transparent px-2.5 py-1 text-xs text-secondary">Decline</button>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        <div style={{ marginTop: 16, borderTop: "1px solid var(--border-subtle)", paddingTop: 14 }}>
+        <div className="mt-4 border-t border-subtle pt-3.5">
           {creating ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="flex flex-col gap-2">
               <input
                 value={teamName} onChange={(e) => setTeamName(e.target.value)} placeholder="Team name" autoFocus
-                style={{ border: "1px solid var(--border-default)", background: "var(--card-bg)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "var(--text-primary)", fontFamily: SANS, outline: "none" }}
+                className="rounded-lg border border-default bg-card px-2.5 py-2 text-[13px] font-sans text-primary outline-none"
               />
-              <div style={{ display: "flex", gap: 8 }}>
+              <div className="flex gap-2">
                 <input
                   value={stashName} onChange={(e) => setStashName(e.target.value)} placeholder="First stash"
-                  style={{ flex: 1, border: "1px solid var(--border-default)", background: "var(--card-bg)", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "var(--text-primary)", fontFamily: SANS, outline: "none" }}
+                  className="flex-1 rounded-lg border border-default bg-card px-2.5 py-2 text-[13px] font-sans text-primary outline-none"
                 />
-                <button onClick={createTeam} disabled={busy || !teamName.trim() || !stashName.trim()} style={{ border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)", borderRadius: 8, padding: "0 12px", fontSize: 12.5, cursor: "pointer" }}>Create</button>
+                <button onClick={createTeam} disabled={busy || !teamName.trim() || !stashName.trim()} className="cursor-pointer rounded-lg border border-primary bg-primary px-3 text-[12.5px] text-card">Create</button>
               </div>
             </div>
           ) : (
             <button
               onClick={() => setCreating(true)}
-              className="sd-hover-bg"
-              style={{ display: "flex", alignItems: "center", gap: 8, border: "none", background: "none", color: "var(--text-muted)", borderRadius: 6, padding: "6px 4px", fontSize: 13, cursor: "pointer" }}
+              className="flex cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-1 py-1.5 text-[13px] text-muted hover:bg-hover hover:text-primary"
             ><Plus size={14} /> New team</button>
           )}
         </div>
 
-        {error && <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 12 }}>{error}</div>}
+        {error && <div className="mt-3 text-xs text-danger">{error}</div>}
       </div>
     </div>
   );

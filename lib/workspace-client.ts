@@ -9,9 +9,9 @@ function slugify(s: string) {
 
 // Creates a brand-new team (org) and its first stash. Shared by Onboarding's
 // "create a team" step and the workspace switcher's "+ New team" row — same
-// two-call sequence either way. A "stash" is a project under the hood (see
-// completeOnboarding) — the name is used for both.
-export async function createTeamAndProject(input: {
+// two-call sequence either way. A stash is owned directly by the workspace,
+// no separate project layer.
+export async function createTeamAndStash(input: {
   teamName: string;
   stashName: string;
 }): Promise<{ organizationId: string; stashId: string }> {
@@ -22,8 +22,6 @@ export async function createTeamAndProject(input: {
   const { stashId } = await completeOnboarding({
     scope: "organization",
     organizationId,
-    projectName: stashName,
-    projectDescription: "",
     stashName,
   });
   await authClient.organization.setActive({ organizationId });
@@ -31,7 +29,7 @@ export async function createTeamAndProject(input: {
 }
 
 // Accept an invitation, switch the active workspace to it, and make sure
-// it has a project to land in.
+// it has a stash to land in.
 export async function acceptInvite(invitationId: string, organizationId: string): Promise<void> {
   const { error } = await authClient.organization.acceptInvitation({ invitationId });
   if (error) throw new Error(error.message || "Couldn't accept that invite.");

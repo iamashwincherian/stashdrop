@@ -1,9 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useRouter } from "next/navigation";
 import {
-  CLUSTERS,
   MARK,
   TINT,
   bars,
@@ -12,24 +11,38 @@ import {
   type StashItem,
   type Kind,
 } from "@/lib/data";
-import { keepUrl, getItem, savePosition, deleteItem, trashItem, restoreItem, emptyTrash, listTrash, updateItemFields, searchItems, addComment, addItemComment, listItemComments, type SearchHit, type KeepResult } from "@/lib/actions";
+import { keepUrl, getItem, savePosition, deleteItem, trashItem, restoreItem, emptyTrash, listTrash, updateItemFields, searchItems, addComment, addItemComment, listItemComments, moveItemToStash, keepFile, createFolder, addAsk, askQuestion, saveFolderPosition, renameFolder, deleteFolder, type SearchHit, type KeepResult } from "@/lib/actions";
+import { createNewStash, switchStash } from "@/lib/workspace-actions";
 import type { ItemComment } from "@/lib/db";
-import { Trash2, Sun, Moon, Monitor, Pencil, ChevronDown, Settings as SettingsIcon, Building2, User as UserIcon, Send } from "lucide-react";
+import { Trash2, Sun, Moon, Monitor, Pencil, ChevronDown, Settings as SettingsIcon, Building2, User as UserIcon, Send, Layers, FolderInput, Plus, Check, StickyNote, Sparkles, ImagePlus, FolderPlus, FolderMinus } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import Onboarding from "./Onboarding";
-import ProjectSettingsModal from "./ProjectSettingsModal";
+import SettingsModal from "./SettingsModal";
 import WorkspaceSwitcher from "./WorkspaceSwitcher";
 import UserMenu from "./UserMenu";
 
-const PAPER = "var(--paper)";
-const SERIF = "var(--font-serif), serif";
-const SANS = "var(--font-sans), system-ui, sans-serif";
-const MONO = "var(--font-mono), monospace";
-
-const DEFAULT_CAMERA = { scale: 0.78, tx: -104, ty: 2 };
+const DEFAULT_CAMERA = { scale: 1, tx: -133, ty: 3 };
 const KIND_OPTIONS: Kind[] = ["article", "video", "image", "pdf", "note", "quote", "repo", "shot"];
+// Desk geometry of a folder object (canvas coords) — hit-testing and the
+// rendered button share these.
+const FOLDER_W = 96;
+const FOLDER_H = 92;
 type Theme = "light" | "dark" | "system";
 const THEME_KEY = "stashdrop-theme";
+const GRID_KEY = "stashdrop-grid";
+
+// A flat, single-color folder glyph (macOS Finder style: a small tab
+// overlapping a rounded body) — two overlapping rects in one fill so the
+// seam disappears. Every folder uses the same color; state (hover/open/drag)
+// is shown with a highlight pill behind it instead, never a color change.
+function FolderGlyph({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 20" className={className} aria-hidden="true">
+      <rect x="1" y="3" width="10" height="4" rx="1.5" fill="currentColor" />
+      <rect x="1" y="5" width="22" height="14" rx="2.5" fill="currentColor" />
+    </svg>
+  );
+}
 
 interface Capture {
   text: string;
@@ -67,7 +80,6 @@ interface CanvasProps {
   initialBucket: Record<string, string>;
   initialRecentOrder: string[];
   user: { id: string; name: string; email: string };
-  project: { name: string; description: string } | null;
   workspace: { name: string; organizationId: string | null };
   role: string;
   needsOnboarding: boolean;
@@ -76,14 +88,23 @@ interface CanvasProps {
   // goes straight to naming the first stash under this scope/team.
   onboardingInitialScope?: "user" | "organization";
   onboardingOrganizationId?: string;
+  // The active stash and its siblings within the current workspace — null/
+  // empty during onboarding, before any stash exists yet.
+  stash?: { id: string; name: string; description: string } | null;
+  stashes?: { id: string; name: string }[];
+  clusters?: { key: string; name: string; x: number; y: number }[];
 }
 
-export default function Canvas({ initialItems, initialBucket, initialRecentOrder, user, project, workspace, role, needsOnboarding, onboardingInitialScope, onboardingOrganizationId }: CanvasProps) {
+export default function Canvas({ initialItems, initialBucket, initialRecentOrder, user, workspace, role, needsOnboarding, onboardingInitialScope, onboardingOrganizationId, stash = null, stashes = [], clusters = [] }: CanvasProps) {
   const router = useRouter();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const timeoutsRef = useRef<number[]>([]);
-  const openInEditRef = useRef(false);
+  // Whether the context menu's "Edit" should open the card straight into
+  // edit mode once it becomes focused — state, not a ref, since it's read
+  // back during the render-time focus-change adjustment below (refs can't
+  // be read during render).
+  const [openInEdit, setOpenInEdit] = useState(false);
 
   const [items, setItems] = useState<StashItem[]>(initialItems);
   const [recentOrder, setRecentOrder] = useState<string[]>(initialRecentOrder);
@@ -102,7 +123,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
 
   const [view, setView] = useState<"desk" | "list">("desk");
   const [camera, setCameraState] = useState(DEFAULT_CAMERA);
-  const [sort, setSort] = useState<"pile" | "recent">("pile");
+  const [dragFolder, setDragFolderState] = useState<string | null>(null);
+  const [sort, setSort] = useState<"folder" | "recent">("folder");
   const [dragId, setDragIdState] = useState<string | null>(null);
   const [panning, setPanningState] = useState(false);
 
@@ -112,9 +134,10 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   // following pointermove land in the same tick, before React re-renders.
   const liveRef = useRef({
     dragId: null as string | null, panning: false, scale: DEFAULT_CAMERA.scale,
+    tx: DEFAULT_CAMERA.tx, ty: DEFAULT_CAMERA.ty,
     aiming: false, lastCursor: [0, 0] as [number, number],
     pending: null as PendingCapture | null, ghost: null as GhostCapture | null,
-    placingComment: false,
+    placingComment: false, placingAsk: false, dragFolder: null as string | null,
     // placeGhost/placeComment clear their own "is a ghost pending" flag
     // synchronously (before their first await), which happens before the
     // click event that follows the same pointerdown even fires — so a
@@ -128,6 +151,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     setCameraState((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
       liveRef.current.scale = next.scale;
+      liveRef.current.tx = next.tx;
+      liveRef.current.ty = next.ty;
       return next;
     });
   }, []);
@@ -136,21 +161,30 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   // can't tell a real click from a drag-then-release on the same element —
   // this ref is the actual signal the click handler checks.
   const dragDistanceRef = useRef(0);
+  const folderDragDistanceRef = useRef(0);
   const startDrag = useCallback((id: string) => {
     dragDistanceRef.current = 0;
     liveRef.current.dragId = id;
     setDragIdState(id);
   }, []);
+  const startFolderDrag = useCallback((key: string) => {
+    folderDragDistanceRef.current = 0;
+    liveRef.current.dragFolder = key;
+    setDragFolderState(key);
+  }, []);
   const startPan = useCallback(() => { liveRef.current.panning = true; setPanningState(true); }, []);
   const endDragAndPan = useCallback(() => {
     liveRef.current.dragId = null;
     liveRef.current.panning = false;
+    liveRef.current.dragFolder = null;
     setDragIdState(null);
     setPanningState(false);
+    setDragFolderState(null);
   }, []);
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [query, setQueryState] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [brokenImages, setBrokenImages] = useState<Set<string>>(new Set());
@@ -183,6 +217,86 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const thumbRef = useRef<HTMLDivElement>(null);
   const cancelledPidsRef = useRef<Set<string>>(new Set());
 
+  // Mirror of items for the window-level pointer handlers, which are
+  // registered once and would otherwise close over a stale copy.
+  const itemsRef = useRef(items);
+  useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // Folders (clusters) for this stash — dynamic now, seeded from the server
+  // and appended to when the user creates one from the toolbar. Positions
+  // live separately in folderPos below.
+  const [clusterList, setClusterList] = useState<{ key: string; name: string }[]>(clusters);
+  const clusterNames = Object.fromEntries(clusterList.map((c) => [c.key, c.name]));
+  const clusterListRef = useRef(clusterList);
+  useEffect(() => { clusterListRef.current = clusterList; }, [clusterList]);
+
+  // Folders are draggable desk objects now, so they own a position map like
+  // the items do. Seeded from the server (x/y = -1 means "never moved yet"
+  // → fall back to the deterministic default row), mirrored in a ref so the
+  // window-level drag handlers always see the latest value.
+  const [folderPos, setFolderPosState] = useState<Record<string, { x: number; y: number }>>(() =>
+    Object.fromEntries(clusters.map((c, i) => [
+      c.key,
+      c.x >= 0 ? { x: c.x, y: c.y } : { x: 750 + i * (FOLDER_W + 26), y: 300 },
+    ]))
+  );
+  const folderPosRef = useRef(folderPos);
+  const setFolderPos = useCallback((updater: (prev: Record<string, { x: number; y: number }>) => Record<string, { x: number; y: number }>) => {
+    const next = updater(folderPosRef.current);
+    folderPosRef.current = next;
+    setFolderPosState(next);
+  }, []);
+  // Desk rects of every folder (computed below, per render) so the drag
+  // handlers can hit-test drops without re-reading the DOM.
+  const folderRectsRef = useRef<Record<string, { x: number; y: number; w: number; h: number }>>({});
+  // Which folder the dragged card is currently over (drop highlight), which
+  // folder is being dragged, and which folder is open (contents spilling out
+  // below it).
+  const [dragOverCluster, setDragOverCluster] = useState<string | null>(null);
+  const [openFolder, setOpenFolder] = useState<Set<string>>(new Set());
+  const openFolderRef = useRef<Set<string>>(new Set());
+  useEffect(() => { openFolderRef.current = openFolder; }, [openFolder]);
+  // Which folder got a flash ("something was filed in here") — cleared after
+  // the animation, so rapid successive drops restart it via state churn.
+  const [flashedFolder, setFlashedFolder] = useState<string | null>(null);
+  // Folder right-click menu, its rename modal, and the (non-dismissable)
+  // delete confirmation.
+  const [folderMenu, setFolderMenu] = useState<{ key: string; x: number; y: number } | null>(null);
+  const [folderRenameKey, setFolderRenameKey] = useState<string | null>(null);
+  const [folderRename, setFolderRename] = useState("");
+  const [deleteFolderKey, setDeleteFolderKey] = useState<string | null>(null);
+
+  // Multi-select (shift-drag rubber band on the background, shift-click a
+  // card) + the marquee rectangle being drawn right now (canvas coords).
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const marqueeRef = useRef<{ startX: number; startY: number } | null>(null);
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+
+  // "Ask anything" card — same place-then-type flow as comments.
+  const [placingAsk, setPlacingAskState] = useState(false);
+  const [autoFocusAskId, setAutoFocusAskId] = useState<string | null>(null);
+  const askContextRef = useRef<string[]>([]);
+  const [askingIds, setAskingIds] = useState<string[]>([]);
+
+  // Right toolbar: hidden file input for dropping/importing images, and
+  // the inline "new folder" prompt.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchBarRef = useRef<HTMLDivElement>(null);
+  const flipFromRef = useRef<DOMRect | null>(null);
+  const [folderCreateOpen, setFolderCreateOpen] = useState(false);
+  const [folderName, setFolderName] = useState("");
+
+  // Undo toast for trashed items.
+  const [toast, setToast] = useState<{ text: string; items: StashItem[] } | null>(null);
+  const toastTimerRef = useRef<number | undefined>(undefined);
+  const showUndoToast = useCallback((text: string, items: StashItem[]) => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    setToast({ text, items });
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 5000);
+  }, []);
+  useEffect(() => () => { if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current); }, []);
+
   // "light" is the true default (matches layout.tsx's before-paint script) —
   // "system" is only ever active once a user explicitly picks Auto.
   const [theme, setThemeState] = useState<Theme>("light");
@@ -205,6 +319,21 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     } catch { /* ignore */ }
     if (t === "system") document.documentElement.removeAttribute("data-theme");
     else document.documentElement.setAttribute("data-theme", t);
+  }, []);
+
+  // Purely cosmetic per-browser preference — same localStorage pattern as
+  // theme, no reason to round-trip it through the stash's own settings.
+  const [paperGrid, setPaperGridState] = useState(true);
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(GRID_KEY);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (stored === "off") setPaperGridState(false);
+    } catch { /* localStorage unavailable — stay on */ }
+  }, []);
+  const setPaperGrid = useCallback((on: boolean) => {
+    setPaperGridState(on);
+    try { localStorage.setItem(GRID_KEY, on ? "on" : "off"); } catch { /* ignore */ }
   }, []);
 
   // Surfaces a just-received team invite as the workspace switcher, once
@@ -237,15 +366,15 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     setPlacingCommentState(v);
   }
 
-  function beginPlacingComment() {
-    if (placingComment) { setPlacingComment(false); liveRef.current.aiming = false; return; }
+  const beginPlacingComment = useCallback(() => {
+    if (liveRef.current.placingComment) { setPlacingComment(false); liveRef.current.aiming = false; return; }
     const target = liveRef.current.lastCursor[0] || liveRef.current.lastCursor[1]
       ? liveRef.current.lastCursor
       : ([window.innerWidth / 2 - 100, window.innerHeight / 2 - 60] as [number, number]);
     setCursor(target);
     liveRef.current.aiming = true;
     setPlacingComment(true);
-  }
+  }, []);
 
   async function placeComment(clientX: number, clientY: number) {
     setPlacingComment(false);
@@ -270,6 +399,275 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     if (updated) setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
   }
 
+  // A freshly created item lands in the desk state the same way whether it
+  // was a comment, an ask card, a dropped file, or a ghost drop.
+  const addItemToDesk = useCallback((item: StashItem) => {
+    setItems((prev) => [...prev, item]);
+    setBucket((prev) => ({ ...prev, [item.id]: "This week" }));
+    setRecentOrder((prev) => [item.id, ...prev]);
+    setPos((prev) => ({ ...prev, [item.id]: [item.x, item.y] }));
+    setLandedId(item.id);
+    window.setTimeout(() => setLandedId((prev) => (prev === item.id ? null : prev)), 700);
+  }, [setItems, setBucket, setRecentOrder, setPos]);
+
+  function setPlacingAsk(v: boolean) {
+    liveRef.current.placingAsk = v;
+    setPlacingAskState(v);
+  }
+
+  function beginPlacingAsk(withContext?: string[]) {
+    if (placingAsk) { setPlacingAsk(false); liveRef.current.aiming = false; return; }
+    askContextRef.current = withContext ?? selectedIds;
+    const target = liveRef.current.lastCursor[0] || liveRef.current.lastCursor[1]
+      ? liveRef.current.lastCursor
+      : ([window.innerWidth / 2 - 100, window.innerHeight / 2 - 60] as [number, number]);
+    setCursor(target);
+    liveRef.current.aiming = true;
+    setPlacingAsk(true);
+  }
+
+  async function placeAsk(clientX: number, clientY: number) {
+    setPlacingAsk(false);
+    liveRef.current.aiming = false;
+    const x = (clientX - camera.tx) / camera.scale - 105;
+    const y = (clientY - camera.ty) / camera.scale - 60;
+    const item = await addAsk(x, y);
+    addItemToDesk(item);
+    setAutoFocusAskId(item.id);
+  }
+
+  async function submitAsk(id: string, question: string) {
+    const q = question.trim();
+    if (!q || askingIds.includes(id)) return;
+    const current = items.find((o) => o.id === id);
+    if (!current) return;
+    setAskingIds((prev) => [...prev, id]);
+    setItems((prev) => prev.map((o) => (o.id === id ? { ...o, title: q } : o)));
+    try {
+      const updated = await askQuestion(id, q, askContextRef.current);
+      if (updated) setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
+    } finally {
+      setAskingIds((prev) => prev.filter((i) => i !== id));
+    }
+    askContextRef.current = [];
+  }
+
+  function readFileAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  const captureTimerRef = useRef<number | undefined>(undefined);
+  const showCapture = useCallback((c: Capture, ms = 3200) => {
+    if (captureTimerRef.current) window.clearTimeout(captureTimerRef.current);
+    setCapture(c);
+    captureTimerRef.current = window.setTimeout(() => setCapture(null), ms);
+  }, []);
+
+  // AI enrichment (tags/description/context/highlights) lands after the
+  // item is already captured, not before — see keepUrl's comment. This
+  // polls for that background pass and patches the item wherever it
+  // currently is: a pending preview, a held/flying ghost, or an
+  // already-placed desk card. Stops on its own once the item is gone
+  // (discarded) or enrichment lands; gives up after ~45s either way.
+  // Used by URL captures and, for PDFs, by the drop/paste flow below.
+  const applyEnrichment = useCallback((id: string, patch: Partial<StashItem>) => {
+    setPending((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
+    setGhost((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
+    setItems((prev) => prev.map((o) => (o.id === id ? { ...o, ...patch } : o)));
+  }, [setPending, setGhost, setItems]);
+
+  const pollEnrichment = useCallback(async (id: string) => {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const res = await getItem(id);
+      if (!res) return; // discarded before enrichment landed
+      if (res.enrichedAt) {
+        applyEnrichment(id, {
+          tags: res.item.tags, description: res.item.description,
+          context: res.item.context, highlights: res.item.highlights,
+          related: res.item.related,
+        });
+        return;
+      }
+    }
+  }, [applyEnrichment]);
+
+  const keepFileItem = useCallback(async (name: string, dataUrl: string, type: string, clientX?: number, clientY?: number) => {
+    const { scale, tx, ty } = liveRef.current;
+    const [lcx, lcy] = liveRef.current.lastCursor;
+    const cx = clientX ?? lcx;
+    const cy = clientY ?? lcy;
+    const has = (cx || cy);
+    const x = has ? (cx - tx) / scale - 100 : 700;
+    const y = has ? (cy - ty) / scale - 60 : 500;
+    try {
+      const item = await keepFile(name, dataUrl, x, y);
+      addItemToDesk(item);
+      if (item.kind === "pdf") void pollEnrichment(item.id);
+    } catch {
+      showCapture({ text: "Couldn't keep that file", dot: "var(--danger)", anim: "none" });
+    }
+  }, [addItemToDesk, showCapture, pollEnrichment]);
+
+  async function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const dataUrl = await readFileAsDataUrl(file);
+    await keepFileItem(file.name, dataUrl, file.type);
+  }
+
+  async function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    const dataUrl = await readFileAsDataUrl(file);
+    await keepFileItem(file.name, dataUrl, file.type, e.clientX, e.clientY);
+  }
+
+  // Paste-to-keep for clipboard images (URLs still go through the search
+  // bar, which handles text paste on its own).
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const files = e.clipboardData?.files;
+      if (!files || !files.length) return;
+      const file = files[0];
+      if (!file.type.startsWith("image/")) return;
+      e.preventDefault();
+      void (async () => {
+        const dataUrl = await readFileAsDataUrl(file);
+        const [lx, ly] = liveRef.current.lastCursor;
+        await keepFileItem(file.name, dataUrl, file.type, lx, ly);
+      })();
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [keepFileItem]);
+
+  async function handleCreateFolder() {
+    const name = folderName.trim();
+    if (!name) return;
+    try {
+      const folder = await createFolder(name);
+      setClusterList((prev) => [...prev, folder]);
+      // New folders land at the end of the default row until dragged away.
+      setFolderPos((prev) => ({
+        ...prev,
+        [folder.key]: { x: 750 + clusterListRef.current.length * (FOLDER_W + 26), y: 300 },
+      }));
+      setFolderName("");
+      setFolderCreateOpen(false);
+      showCapture({ text: `Folder "${folder.name}" created`, dot: "var(--text-muted)", anim: "none" });
+    } catch {
+      showCapture({ text: "Couldn't create that folder", dot: "var(--danger)", anim: "none" });
+    }
+  }
+
+  async function undoTrash() {
+    if (!toast) return;
+    const itemsToRestore = toast.items;
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    setToast(null);
+    for (const item of itemsToRestore) {
+      try { await restoreItem(item.id); } catch { continue; }
+    }
+    setItems((prev) => [...prev, ...itemsToRestore]);
+    setPos((prev) => Object.fromEntries([...Object.entries(prev), ...itemsToRestore.map((o) => [o.id, [o.x, o.y] as [number, number]])]));
+  }
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
+  }
+
+  async function bulkTrashSelected() {
+    const doomed = selectedIds.map((id) => items.find((o) => o.id === id)).filter((o): o is StashItem => !!o);
+    for (const item of doomed) {
+      try { await trashItem(item.id); } catch { continue; }
+    }
+    setItems((prev) => prev.filter((o) => !selectedIds.includes(o.id)));
+    setPos((prev) => { const next = { ...prev }; selectedIds.forEach((id) => delete next[id]); return next; });
+    setSelectedIds([]);
+    if (doomed.length) showUndoToast(`Deleted ${doomed.length} thing${doomed.length === 1 ? "" : "s"}`, doomed);
+  }
+
+  async function bulkMoveSelected(cluster: string) {
+    const targets = selectedIds.filter((id) => items.find((o) => o.id === id)?.cluster !== cluster);
+    for (const id of targets) {
+      const updated = await updateItemFields(id, { cluster });
+      if (updated) setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
+    }
+    setSelectedIds([]);
+  }
+
+  // Opening a folder spills its contents out below it (a fanned cascade),
+  // so you can see and drag them; closing tucks them back inside. Items stay
+  // filed (cluster unchanged) while spilled — the only way to unlink one is
+  // the context menu's "Remove from folder".
+  function toggleFolder(key: string) {
+    if (openFolderRef.current.has(key)) {
+      setOpenFolder((prev) => { const next = new Set(prev); next.delete(key); return next; });
+      return;
+    }
+    setOpenFolder((prev) => new Set(prev).add(key));
+    const r = folderPosRef.current[key] ?? { x: 750, y: 300 };
+    const members = itemsRef.current.filter((o) => o.cluster === key);
+    members.forEach((o, i) => {
+      const nx = r.x + 16 + i * 30;
+      const ny = r.y + FOLDER_H + 40 + i * 36;
+      setPos((prev) => ({ ...prev, [o.id]: [nx, ny] }));
+      void savePosition(o.id, nx, ny);
+    });
+  }
+
+  // Unlinks a card from its folder (cluster → ""), leaving it exactly where
+  // it is — no repositioning. Called only from the context menu.
+  function removeFromFolder(id: string) {
+    const it = itemsRef.current.find((o) => o.id === id);
+    if (!it?.cluster) return;
+    void updateItemFields(id, { cluster: "" }).then((updated) => {
+      if (!updated) return;
+      setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
+    });
+  }
+
+  async function saveFolderRename() {
+    if (!folderRenameKey) return;
+    const res = await renameFolder(folderRenameKey, folderRename);
+    if (res) {
+      setClusterList((prev) => prev.map((c) => (c.key === res.key ? { ...c, name: res.name } : c)));
+      setFolderRenameKey(null);
+    }
+  }
+
+  // Delete the folder, then reconcile local state with what the server did:
+  // "keep" unlinks the contents back to the desk, "delete" removes them.
+  async function handleDeleteFolder(mode: "keep" | "delete") {
+    if (!deleteFolderKey) return;
+    const key = deleteFolderKey;
+    const doomed = items.filter((o) => o.cluster === key);
+    await deleteFolder(key, mode);
+    setClusterList((prev) => prev.filter((c) => c.key !== key));
+    setFolderPos((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    setOpenFolder((prev) => { const next = new Set(prev); next.delete(key); return next; });
+    if (mode === "keep") {
+      setItems((prev) => prev.map((o) => (o.cluster === key ? { ...o, cluster: "" } : o)));
+    } else {
+      setItems((prev) => prev.filter((o) => o.cluster !== key));
+      setPos((prev) => { const next = { ...prev }; doomed.forEach((o) => delete next[o.id]); return next; });
+    }
+    setDeleteFolderKey(null);
+    setFolderMenu(null);
+    showCapture({
+      text: mode === "keep" ? "Folder deleted — items kept on the desk" : `Deleted folder and ${doomed.length} item${doomed.length === 1 ? "" : "s"}`,
+      dot: "var(--text-muted)", anim: "none",
+    });
+  }
+
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState("");
   const [editBody, setEditBody] = useState("");
@@ -283,7 +681,20 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [trashItems, setTrashItems] = useState<(StashItem & { deletedAt: number })[]>([]);
   const [emptyArmed, setEmptyArmed] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const [stashMenuOpen, setStashMenuOpen] = useState(false);
+  const [newStashName, setNewStashName] = useState("");
+  const [stashBusy, setStashBusy] = useState(false);
+
+  // The move submenu is only meaningful for whichever card's context menu
+  // is currently open — every place that opens or closes contextMenu below
+  // also collapses this, so it never survives onto a different card or an
+  // already-closed menu.
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+    setMoveMenuOpen(false);
+  }, []);
 
   const searchTimerRef = useRef<number | undefined>(undefined);
   const searchSeqRef = useRef(0);
@@ -293,11 +704,10 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     timeoutsRef.current.push(id);
   }, []);
 
-  const captureTimerRef = useRef<number | undefined>(undefined);
-  const showCapture = useCallback((c: Capture, ms = 3200) => {
-    if (captureTimerRef.current) window.clearTimeout(captureTimerRef.current);
-    setCapture(c);
-    captureTimerRef.current = window.setTimeout(() => setCapture(null), ms);
+  // Re-triggers the "filed in here" pulse on a folder (sd-land outline).
+  const flashFolder = useCallback((key: string) => {
+    setFlashedFolder(null);
+    window.setTimeout(() => setFlashedFolder(key), 20);
   }, []);
 
   useEffect(() => () => {
@@ -331,6 +741,20 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     // on first render, before that const is initialized). setPending/
     // setGhost are already stable by this point, so this stays safe.
     const onKey = (e: KeyboardEvent) => {
+      // ⌘/Ctrl+K focuses the search bar; "/" drops a comment — but never
+      // steal typing from an input/textarea/select that's already focused.
+      const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        flipFromRef.current = searchBarRef.current?.getBoundingClientRect() ?? null;
+        setSearchOpen(true);
+        return;
+      }
+      if (e.key === "/" && !inField) {
+        e.preventDefault();
+        beginPlacingComment();
+        return;
+      }
       if (e.key === "Escape") {
         const p = liveRef.current.pending || liveRef.current.ghost;
         if (p) {
@@ -339,20 +763,58 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         }
         liveRef.current.aiming = false;
         liveRef.current.placingComment = false;
+        liveRef.current.placingAsk = false;
         setPending(null);
         setGhost(null);
         setPlacingCommentState(false);
+        setPlacingAskState(false);
         setFocusId(null);
         setTrashOpen(false);
-        setContextMenu(null);
+        setSelectedIds([]);
+        setMarquee(null);
+        marqueeRef.current = null;
+        setFolderCreateOpen(false);
+        closeContextMenu();
         setThemeMenuOpen(false);
+        setStashMenuOpen(false);
+        setSearchOpen(false);
+        setOpenFolder(new Set());
+        setFolderMenu(null);
+        setFolderRenameKey(null);
         setQueryState("");
         setSearchResults([]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setPending, setGhost]);
+  }, [setPending, setGhost, closeContextMenu, beginPlacingComment]);
+
+  // ⌘K "pop-out" — FLIP the search bar from its inline spot (top-center)
+  // to the center of the screen when the palette opens. Measure the old
+  // rect in the keydown handler (before the re-render), then after this
+  // layout commits, animate the new rect back from the old one so the bar
+  // appears to glide out, grow, and settle — the same trick Linear/cmdk
+  // use for their command palettes.
+  useLayoutEffect(() => {
+    const el = searchBarRef.current;
+    if (!searchOpen) return;
+    searchInputRef.current?.focus();
+    if (!el || !flipFromRef.current) return;
+    const first = flipFromRef.current;
+    flipFromRef.current = null;
+    const last = el.getBoundingClientRect();
+    const dx = first.left - last.left;
+    const dy = first.top - last.top;
+    const sx = first.width / last.width;
+    const sy = first.height / last.height;
+    el.animate(
+      [
+        { transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`, transformOrigin: "top left" },
+        { transform: "none", transformOrigin: "top left" },
+      ],
+      { duration: 420, easing: "cubic-bezier(.2,.8,.2,1)" },
+    );
+  }, [searchOpen]);
 
   // Reset the edit/delete-confirm UI whenever the focused item changes.
   // Adjusted during render (React's documented pattern for this) rather
@@ -360,8 +822,8 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const [lastFocusId, setLastFocusId] = useState(focusId);
   if (lastFocusId !== focusId) {
     setLastFocusId(focusId);
-    setEditing(openInEditRef.current);
-    openInEditRef.current = false;
+    setEditing(openInEdit);
+    setOpenInEdit(false);
     setDeleteArmed(false);
     const f = focusId ? items.find((o) => o.id === focusId) : null;
     setEditTitle(f ? f.title : "");
@@ -374,27 +836,126 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   }
 
   useEffect(() => {
+    // Which folder a card at (x, y) would land in if dropped there right
+    // now. Used live during drag (for the "over" highlight) and again at
+    // drop — the same rect check for both, so the folder that lights up
+    // while dragging is always the one the card actually files into.
+    const folderHit = (x: number, y: number, item: StashItem | undefined): string | null => {
+      const h = item?.isText ? 115 : (item?.kind === "image" || item?.kind === "shot" ? 205 : 180);
+      const cx = x + (item?.w ?? 196) / 2, cy = y + h / 2;
+      const found = Object.entries(folderRectsRef.current).find(([, r]) =>
+        cx > r.x - 24 && cx < r.x + r.w + 24 && cy > r.y - 24 && cy < r.y + r.h + 24
+      );
+      return found ? found[0] : null;
+    };
     const move = (e: PointerEvent) => {
       liveRef.current.lastCursor = [e.clientX, e.clientY];
       if (liveRef.current.aiming) setCursor(liveRef.current.lastCursor);
       const id = liveRef.current.dragId;
-      if (id) {
+      const fk = liveRef.current.dragFolder;
+      if (fk) {
+        folderDragDistanceRef.current += Math.abs(e.movementX) + Math.abs(e.movementY);
+        const dx = e.movementX / liveRef.current.scale, dy = e.movementY / liveRef.current.scale;
+        setFolderPos((prev) => {
+          const p = prev[fk] ?? { x: 750, y: 300 };
+          return { ...prev, [fk]: { x: p.x + dx, y: p.y + dy } };
+        });
+        // An open folder drags its spilled contents along with it.
+        if (openFolderRef.current.has(fk)) {
+          setPos((prev) => {
+            let next = prev;
+            for (const o of itemsRef.current) {
+              if (o.cluster !== fk) continue;
+              const [ox, oy] = next[o.id] ?? [o.x, o.y];
+              next = { ...next, [o.id]: [ox + dx, oy + dy] };
+            }
+            return next;
+          });
+        }
+      } else if (id) {
         dragDistanceRef.current += Math.abs(e.movementX) + Math.abs(e.movementY);
         setPos((prev) => {
           const [x, y] = prev[id];
           return { ...prev, [id]: [x + e.movementX / liveRef.current.scale, y + e.movementY / liveRef.current.scale] };
         });
+        const [nx, ny] = posRef.current[id];
+        const draggedItem = itemsRef.current.find((o) => o.id === id);
+        setDragOverCluster((prev) => {
+          const next = folderHit(nx, ny, draggedItem);
+          return prev === next ? prev : next;
+        });
       } else if (liveRef.current.panning) {
         setCamera((s) => ({ ...s, tx: s.tx + e.movementX, ty: s.ty + e.movementY }));
+      } else if (marqueeRef.current) {
+        const { startX, startY } = marqueeRef.current;
+        const { scale, tx, ty } = liveRef.current;
+        const cx = (e.clientX - tx) / scale, cy = (e.clientY - ty) / scale;
+        setMarquee({ x0: Math.min(startX, cx), y0: Math.min(startY, cy), x1: Math.max(startX, cx), y1: Math.max(startY, cy) });
       }
     };
-    const up = () => {
+    const up = (e: PointerEvent) => {
       const id = liveRef.current.dragId;
-      if (id) {
+      const fk = liveRef.current.dragFolder;
+      if (fk) {
+        const p = folderPosRef.current[fk];
+        if (p) void saveFolderPosition(fk, p.x, p.y);
+      } else if (id) {
         const [x, y] = posRef.current[id];
-        void savePosition(id, x, y);
+        const item = itemsRef.current.find((o) => o.id === id);
+        // Dropping a card onto a folder files it inside — the folder hides
+        // the card from the desk until it's spilled back out. Same rect
+        // check that drove the "over" highlight during the drag, so the
+        // folder that was lit up is always the one it actually lands in.
+        const hitKey = item ? folderHit(x, y, item) : null;
+        if (item && hitKey) {
+          if (hitKey === item.cluster) {
+            // Dropped back on its own (open) folder — stays filed.
+            void savePosition(id, x, y);
+          } else {
+            const name = clusterListRef.current.find((c) => c.key === hitKey)?.name || "folder";
+            showCapture({ text: `Moved into "${name}"`, dot: "var(--text-muted)", anim: "none" });
+            flashFolder(hitKey);
+            void updateItemFields(id, { cluster: hitKey }).then((updated) => {
+              if (!updated) return;
+              setItems((prev) => prev.map((o) => (o.id === id ? updated : o)));
+              // If the target folder is open, the card stays visible — so
+              // tuck it onto the end of the spill cascade instead of leaving
+              // it sitting on top of the folder icon.
+              if (openFolderRef.current.has(hitKey)) {
+                const r = folderRectsRef.current[hitKey];
+                const n = itemsRef.current.filter((o) => o.cluster === hitKey).length;
+                const nx = r.x + 16 + n * 30;
+                const ny = r.y + FOLDER_H + 40 + n * 36;
+                setPos((prev) => ({ ...prev, [id]: [nx, ny] }));
+                void savePosition(id, nx, ny);
+              }
+            });
+          }
+        } else {
+          // Dropped on the desk — a spilled card keeps its folder; removing
+          // it from a folder is deliberate (context menu → "Remove from
+          // folder"), not a side effect of where you let go.
+          void savePosition(id, x, y);
+        }
+      } else if (marqueeRef.current) {
+        const { startX, startY } = marqueeRef.current;
+        const { scale, tx, ty } = liveRef.current;
+        const cx = (e.clientX - tx) / scale, cy = (e.clientY - ty) / scale;
+        const x0 = Math.min(startX, cx), y0 = Math.min(startY, cy), x1 = Math.max(startX, cx), y1 = Math.max(startY, cy);
+        const sel = itemsRef.current
+          .filter((o) => {
+            const [x, y] = posRef.current[o.id] || [o.x, o.y];
+            const h = o.isText ? 115 : (o.kind === "image" || o.kind === "shot" ? 205 : 180);
+            const w = o.w * 1.15;
+            return x < x1 && x + w > x0 && y < y1 && y + h > y0;
+          })
+          .map((o) => o.id);
+        setSelectedIds(sel);
+        marqueeRef.current = null;
+        setMarquee(null);
       }
       endDragAndPan();
+      setDragOverCluster(null);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -402,7 +963,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
-  }, [setPos, setCamera, endDragAndPan]);
+  }, [setPos, setFolderPos, setCamera, endDragAndPan, showCapture, flashFolder]);
 
   const isUrl = (v: string) => /^https?:\/\/|^www\./i.test(v.trim());
 
@@ -427,6 +988,10 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     const full = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
     let host = full;
     try { host = new URL(full).hostname.replace(/^www\./, ""); } catch { /* keep raw as fallback */ }
+    // beginCapture only ever runs from onChangeQuery, itself only wired to
+    // the search input's onChange — never during render — so this is safe
+    // despite the lint rule's conservative (can't prove it here) flag.
+    // eslint-disable-next-line react-hooks/purity
     const pid = "p" + Date.now().toString(36) + Math.round(Math.random() * 100);
 
     setSearchResults([]);
@@ -468,25 +1033,18 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   // it currently is: still the pending preview, a held/flying ghost, or
   // already placed on the desk. Stops on its own once the item is gone
   // (discarded) or enrichment lands; gives up after ~45s either way.
-  function applyEnrichment(id: string, patch: Partial<StashItem>) {
-    setPending((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
-    setGhost((prev) => (prev && prev.item && prev.item.id === id ? { ...prev, item: { ...prev.item, ...patch } } : prev));
-    setItems((prev) => prev.map((o) => (o.id === id ? { ...o, ...patch } : o)));
-  }
-
-  async function pollEnrichment(id: string) {
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const res = await getItem(id);
-      if (!res) return; // discarded before enrichment landed
-      if (res.enrichedAt) {
-        applyEnrichment(id, {
-          tags: res.item.tags, description: res.item.description,
-          context: res.item.context, highlights: res.item.highlights,
-          related: res.item.related,
-        });
-        return;
-      }
+  // Browsers refuse to navigate a tab to a data: URL (blank page), so a
+  // stored PDF opens via a same-origin blob URL instead — the PDF viewer
+  // renders those fine.
+  async function openPdf(dataUrl: string) {
+    try {
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener");
+      window.setTimeout(() => URL.revokeObjectURL(url), 120_000);
+    } catch {
+      showCapture({ text: "Couldn't open that PDF", dot: "var(--danger)", anim: "none" });
     }
   }
 
@@ -569,6 +1127,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       if (pendingState?.status === "ready") { startPlacing(); return; }
       if (searchResults.length) {
         setFocusId(searchResults[0].id);
+        setSearchOpen(false);
         setDisc({ highlights: false, related: false, context: false, comments: false });
       }
     }
@@ -592,6 +1151,7 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       later(() => setDeleteArmed(false), 4000);
       return;
     }
+    const doomed = items.find((o) => o.id === id);
     try {
       await trashItem(id);
     } catch { setDeleteArmed(false); return; }
@@ -599,16 +1159,59 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
     setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
     setFocusId(null);
     setDeleteArmed(false);
+    if (doomed) showUndoToast("Deleted", [doomed]);
   }
 
   async function quickTrash(id: string) {
-    setContextMenu(null);
+    closeContextMenu();
+    const doomed = items.find((o) => o.id === id);
     try {
       await trashItem(id);
     } catch { return; }
     setItems((prev) => prev.filter((o) => o.id !== id));
     setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
     setFocusId((f) => (f === id ? null : f));
+    if (doomed) showUndoToast("Deleted", [doomed]);
+  }
+
+  async function moveToStash(id: string, targetStashId: string, targetName: string) {
+    closeContextMenu();
+    try {
+      await moveItemToStash(id, targetStashId);
+    } catch {
+      showCapture({ text: "Couldn't move that", dot: "var(--danger)", anim: "none" });
+      return;
+    }
+    setItems((prev) => prev.filter((o) => o.id !== id));
+    setPos((prev) => { const next = { ...prev }; delete next[id]; return next; });
+    setFocusId((f) => (f === id ? null : f));
+    showCapture({ text: `Moved to ${targetName}`, dot: "var(--text-fainter)", anim: "none" });
+  }
+
+  async function handleSwitchStash(id: string) {
+    if (id === stash?.id) { setStashMenuOpen(false); return; }
+    setStashBusy(true);
+    try {
+      await switchStash(id);
+      setStashMenuOpen(false);
+      router.refresh();
+    } finally {
+      setStashBusy(false);
+    }
+  }
+
+  async function handleCreateStash() {
+    const name = newStashName.trim();
+    if (!name) return;
+    setStashBusy(true);
+    try {
+      await createNewStash(name);
+      setNewStashName("");
+      setStashMenuOpen(false);
+      router.refresh();
+    } finally {
+      setStashBusy(false);
+    }
   }
 
   async function postComment(itemId: string) {
@@ -656,6 +1259,18 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   const zoomedOut = camera.scale < 0.6;
   const barOpen = !!query || !!pendingState || !!ghostState;
 
+  // Folders are draggable desk objects — their desk rects track folderPos,
+  // mirrored into a ref so the drag handlers can hit-test drops. The ??
+  // fallback covers a folder whose position isn't known yet (e.g. React Fast
+  // Refresh preserved clusterList state across an edit that introduced
+  // folderPos), so rendering never crashes on a missing entry.
+  const folderRects: Record<string, { x: number; y: number; w: number; h: number }> = {};
+  for (const key of clusterList.map((c) => c.key)) {
+    const p = folderPos[key] ?? { x: 750, y: 300 };
+    folderRects[key] = { x: p.x, y: p.y, w: FOLDER_W, h: FOLDER_H };
+  }
+  useEffect(() => { folderRectsRef.current = folderRects; });
+
   const contextMenuItem = contextMenu ? items.find((o) => o.id === contextMenu.id) ?? null : null;
   const focusedTrashed = !!focusId && !items.some((o) => o.id === focusId);
   const focused = focusId ? items.find((o) => o.id === focusId) ?? trashItems.find((o) => o.id === focusId) ?? null : null;
@@ -686,13 +1301,14 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   }, [role, user.id]);
 
   let listGroups: { name: string; n: string; items: StashItem[] }[] = [];
-  if (sort === "pile") {
-    listGroups = Object.keys(CLUSTERS)
-      .map((k) => {
-        const mem = items.filter((o) => o.cluster === k);
-        return { name: CLUSTERS[k].name, n: mem.length + " things", items: mem };
-      })
-      .filter((g) => g.items.length);
+  if (sort === "folder") {
+    listGroups = clusterList
+      .map(({ key, name }) => {
+        const mem = items.filter((o) => o.cluster === key);
+        return { name, n: mem.length + " things", items: mem };
+      });
+    const unsorted = items.filter((o) => !clusterNames[o.cluster]);
+    if (unsorted.length) listGroups.push({ name: "Unsorted", n: unsorted.length + " things", items: unsorted });
   } else {
     const ordered = items.slice().sort((a, b) => {
       const ia = recentOrder.indexOf(a.id), ib = recentOrder.indexOf(b.id);
@@ -719,43 +1335,80 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
   }
 
   return (
-    <div
-      style={{
-        height: "100vh", width: "100vw", position: "relative", background: PAPER,
-        color: "var(--text-primary)", fontFamily: SANS, fontSize: 14, lineHeight: 1.45,
-        WebkitFontSmoothing: "antialiased", overflow: "hidden",
-      }}
-    >
+    <div className="relative h-screen w-screen overflow-hidden bg-paper antialiased font-sans text-sm leading-[1.45] text-primary">
       <div
         ref={canvasRef}
         onPointerDown={(e) => {
           if (liveRef.current.ghost) { placeGhost(e.clientX, e.clientY); return; }
           if (liveRef.current.placingComment) { void placeComment(e.clientX, e.clientY); return; }
+          if (liveRef.current.placingAsk) { void placeAsk(e.clientX, e.clientY); return; }
+          if (e.shiftKey) {
+            const { scale, tx, ty } = liveRef.current;
+            marqueeRef.current = { startX: (e.clientX - tx) / scale, startY: (e.clientY - ty) / scale };
+            setMarquee({ x0: marqueeRef.current.startX, y0: marqueeRef.current.startY, x1: marqueeRef.current.startX, y1: marqueeRef.current.startY });
+            return;
+          }
+          setSelectedIds([]);
           startPan(); setFocusId(null);
         }}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => void handleDrop(e)}
+        className={`absolute inset-0 ${panning ? "cursor-grabbing" : "cursor-default"} ${paperGrid ? "bg-[radial-gradient(circle_at_1px_1px,rgba(var(--shadow-color),.055)_1px,transparent_0)]" : "bg-none"} [background-position:var(--sd-gp)] [background-size:var(--sd-gs)]`}
         style={{
-          position: "absolute", inset: 0, cursor: panning ? "grabbing" : "default",
-          backgroundImage: "radial-gradient(circle at 1px 1px, rgba(var(--shadow-color),.055) 1px, transparent 0)",
-          backgroundSize: `${26 * camera.scale}px ${26 * camera.scale}px`,
-          backgroundPosition: `${camera.tx}px ${camera.ty}px`,
-        }}
+          ["--sd-gp" as string]: `${camera.tx}px ${camera.ty}px`,
+          ["--sd-gs" as string]: `${26 * camera.scale}px ${26 * camera.scale}px`,
+        } as CSSProperties}
       >
         <div
-          style={{
-            position: "absolute", left: 0, top: 0,
-            transform: `translate3d(${camera.tx}px, ${camera.ty}px, 0) scale(${camera.scale})`,
-            transformOrigin: "0 0", willChange: "transform",
-          }}
+          className="absolute left-0 top-0 origin-top-left will-change-transform [transform:var(--sd-cam)]"
+          style={{ ["--sd-cam" as string]: `translate3d(${camera.tx}px, ${camera.ty}px, 0) scale(${camera.scale})` } as CSSProperties}
         >
           {/* Board title: lives in canvas space (pans/zooms with everything
               else) but has no pointer handlers at all, so it can't be
               dragged or clicked like the item cards — a fixed landmark. */}
-          <div style={{ position: "absolute", left: 750, top: 140, pointerEvents: "none", userSelect: "none" }}>
-            <div style={{ fontFamily: SERIF, fontSize: 46, letterSpacing: "-.01em", color: "var(--text-primary)", whiteSpace: "nowrap" }}>{project?.name || "Stashdrop"}</div>
-            <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)", marginTop: 4 }}>{project?.description || "everything you've kept, in one place"}</div>
+          <div className="pointer-events-none absolute left-[750px] top-[140px] select-none">
+            <div className="whitespace-nowrap font-serif text-[46px] tracking-[-.01em] text-primary">{stash?.name || "Stashdrop"}</div>
+            <div className="mt-1 font-mono text-[11px] uppercase tracking-[.08em] text-faint">{stash?.description || "everything you've kept, in one place"}</div>
           </div>
 
-          {items.map((o) => {
+          {/* Folders: draggable desk objects. Filed cards hide inside; click
+              to spill them out below the folder, click again to tuck them
+              back in. */}
+          {clusterList.map(({ key, name }) => {
+            const r = folderRects[key];
+            const count = items.filter((o) => o.cluster === key).length;
+            const over = dragOverCluster === key;
+            const open = openFolder.has(key);
+            const dragging = dragFolder === key;
+            const flash = flashedFolder === key;
+            return (
+              <div
+                key={key}
+                className={`absolute left-0 top-0 will-change-transform ${dragging ? "" : "[transition:transform_.18s_cubic-bezier(.2,.8,.2,1)]"} [transform:translate3d(var(--sd-x),var(--sd-y),0)]`}
+                style={{ ["--sd-x" as string]: `${r.x}px`, ["--sd-y" as string]: `${r.y}px` } as CSSProperties}
+              >
+                <button
+                  onPointerDown={(e) => { e.stopPropagation(); startFolderDrag(key); }}
+                  onClick={(e) => { e.stopPropagation(); if (folderDragDistanceRef.current < 4) toggleFolder(key); }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setFolderMenu({ key, x: e.clientX, y: e.clientY });
+                  }}
+                  title={open ? "Click to tuck it all back inside" : "Click to spill it open — drag it to move it"}
+                  className={`relative flex w-[96px] cursor-grab flex-col items-center gap-1 rounded-[12px] border border-transparent px-2 pt-2 pb-1.5 text-center transition-colors active:cursor-grabbing ${flash ? "animate-land" : ""} ${over || open ? "border-accent-border bg-accent-bg" : "hover:bg-hover"}`}
+                >
+                  <FolderGlyph className="h-[54px] w-[68px] text-sticky-border" />
+                  {count > 0 && (
+                    <span className="absolute right-1.5 top-0.5 flex-none rounded-full border border-default bg-card px-1.5 py-px font-mono text-[9.5px] text-faint">{count}</span>
+                  )}
+                  <span className="max-w-full truncate text-[12.5px] font-medium text-primary">{name}</span>
+                </button>
+              </div>
+            );
+          })}
+
+          {items.filter((o) => !clusterNames[o.cluster] || openFolder.has(o.cluster)).map((o) => {
             const [x, y] = pos[o.id];
             const hit = hits ? hits[o.id] ?? null : null;
             const hovered = hoverId === o.id;
@@ -764,47 +1417,45 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             const previewH = (o.kind === "image" || o.kind === "shot" ? 135 : 110);
             const previewBars = isText ? [] : bars(o.kind === "video" ? "image" : o.kind, o.id.charCodeAt(1) || 3);
             const titleOp = zoomedOut && !hit ? 0.35 : 1;
+            const titleDim = titleOp === 0.35;
 
-            const tilt = o.kind === "quote" || o.kind === "note" || o.kind === "comment" ? "-0.5deg" : "0deg";
             const isMenuTarget = contextMenu?.id === o.id;
             const isMenuBackground = !!contextMenu && !isMenuTarget;
-            const style: CSSProperties = {
-              // Positioned via transform, not left/top: left/top changes force
-              // a layout+repaint on every pointermove frame, which is what
-              // made image-heavy cards visibly stutter/redraw mid-drag.
-              // translate3d is compositor-only — no repaint, no jank.
-              position: "absolute", left: 0, top: 0, width: o.w * 1.15,
-              transform: `translate3d(${x}px, ${y}px, 0) rotate(${tilt}) scale(${isMenuTarget ? 1.06 : 1})`,
-              // Keeps the card on its own compositing layer at all times —
-              // toggling this only on hover/drag made the browser promote
-              // and re-rasterize the layer mid-interaction, which is what
-              // made text visibly shiver/refocus on hover.
-              willChange: "transform",
-              backfaceVisibility: "hidden",
-              background: o.kind === "comment" ? "var(--sticky-bg)" : o.kind === "quote" ? "var(--card-bg-alt)" : "var(--card-bg)",
-              border: `1px solid ${hit || hovered ? "var(--border-hover)" : o.kind === "comment" ? "var(--sticky-border)" : "var(--border-default)"}`,
-              borderRadius: isText ? 10 : 11,
-              opacity: isMenuBackground ? 0.5 : dim ? 0.24 : 1,
-              // Shadow is drop-shadow(), not box-shadow: box-shadow changes
-              // force a repaint (CPU re-rasterize) of the whole layer, and
-              // inside this card's scaled ancestor that repaint redraws text
-              // at a shifting subpixel offset — the hover "shiver". filter is
-              // compositor-only, so the already-rasterized text just gets
-              // re-composited, never redrawn.
-              filter: [
-                isMenuBackground && "blur(5px)",
-                isMenuTarget ? "drop-shadow(0 24px 60px rgba(var(--shadow-color),.28))"
-                  : dim ? null : (hovered || hit || dragId === o.id)
-                  ? "drop-shadow(0 12px 30px rgba(var(--shadow-color),.13))"
-                  : "drop-shadow(0 1px 2px rgba(var(--shadow-color),.05)) drop-shadow(0 6px 16px rgba(var(--shadow-color),.045))",
-              ].filter(Boolean).join(" ") || undefined,
-              cursor: "grab",
-              animation: landedId === o.id ? "sd-land .6s ease-out both" : undefined,
-              transition: dragId === o.id ? undefined : "transform .18s cubic-bezier(.2,.8,.2,1), filter .18s ease, opacity .18s ease",
-              zIndex: isMenuTarget ? 62 : undefined,
-              pointerEvents: isMenuBackground ? "none" : undefined,
-              userSelect: "none", overflow: "hidden",
-            };
+            const isSelected = selectedIds.includes(o.id);
+            // Positioned via transform, not left/top: left/top changes force
+            // a layout+repaint on every pointermove frame, which is what
+            // made image-heavy cards visibly stutter/redraw mid-drag.
+            // translate3d is compositor-only — no repaint, no jank. Shadow
+            // is drop-shadow, not box-shadow: box-shadow changes force a
+            // repaint (CPU re-rasterize) of the whole layer, and inside
+            // this card's scaled ancestor that repaint redraws text at a
+            // shifting subpixel offset — the hover "shiver". filter is
+            // compositor-only, so the already-rasterized text just gets
+            // re-composited, never redrawn.
+            const cardClass = [
+              "absolute left-0 top-0 cursor-grab overflow-hidden select-none will-change-transform backface-hidden [width:var(--sd-w)] [transform:translate3d(var(--sd-x),var(--sd-y),0)_scale(var(--sd-s))]",
+              o.kind === "comment" ? "bg-sticky" : o.kind === "quote" ? "bg-card-alt" : "bg-card",
+              isSelected ? "border border-primary" : hit || hovered ? "border border-border-hover" : o.kind === "comment" ? "border border-sticky-border" : "border border-default",
+              isText ? "rounded-[10px]" : "rounded-[11px]",
+              isMenuBackground ? "opacity-50" : dim ? "opacity-24" : "",
+              "filter",
+              isMenuBackground ? "blur-[5px]" : "",
+              isMenuTarget
+                ? "drop-shadow-[0_24px_60px_rgba(var(--shadow-color),.28)]"
+                : dim ? "" : (hovered || hit || dragId === o.id)
+                  ? "drop-shadow-[0_12px_30px_rgba(var(--shadow-color),.13)]"
+                  : "drop-shadow-[0_1px_2px_rgba(var(--shadow-color),.05)] drop-shadow-[0_6px_16px_rgba(var(--shadow-color),.045)]",
+              landedId === o.id ? "animate-land" : "",
+              dragId === o.id ? "" : "[transition:transform_.18s_cubic-bezier(.2,.8,.2,1),filter_.18s_ease,opacity_.18s_ease]",
+              isMenuTarget ? "z-62" : "",
+              isMenuBackground ? "pointer-events-none" : "",
+            ].filter(Boolean).join(" ");
+            const cardVars = {
+              ["--sd-x" as string]: `${x}px`,
+              ["--sd-y" as string]: `${y}px`,
+              ["--sd-s" as string]: isMenuTarget ? 1.06 : 1,
+              ["--sd-w" as string]: `${o.w * 1.15}px`,
+            } as CSSProperties;
 
             return (
               <div
@@ -813,50 +1464,64 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   e.stopPropagation();
                   if (liveRef.current.ghost) { liveRef.current.suppressClick = true; placeGhost(e.clientX, e.clientY); return; }
                   if (liveRef.current.placingComment) { liveRef.current.suppressClick = true; void placeComment(e.clientX, e.clientY); return; }
+                  if (liveRef.current.placingAsk) { liveRef.current.suppressClick = true; void placeAsk(e.clientX, e.clientY); return; }
+                  if (e.shiftKey) return;
                   startDrag(o.id);
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
                   if (liveRef.current.suppressClick) { liveRef.current.suppressClick = false; return; }
+                  if (e.shiftKey) { toggleSelect(o.id); return; }
                   if (dragDistanceRef.current < 4) { setFocusId(o.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  setMoveMenuOpen(false);
                   setContextMenu({ id: o.id, x: e.clientX, y: e.clientY });
                 }}
                 onMouseEnter={() => setHoverId(o.id)}
                 onMouseLeave={() => setHoverId((h) => (h === o.id ? null : h))}
-                style={style}
+                className={cardClass}
+                style={cardVars}
               >
+                {o.cluster && (
+                  <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[3px] bg-accent" />
+                )}
                 {!isText && (
-                  <div style={{
-                    height: previewH, background: TINT[o.kind] || "var(--tint-article)", borderBottom: `1px solid ${hit || hovered ? "var(--border-hover)" : "var(--border-default)"}`,
-                    position: "relative", display: "grid", placeItems: "center", overflow: "hidden",
-                  }}>
-                    {o.image && !brokenImages.has(o.id) ? (
+                  <div className={`relative grid place-items-center overflow-hidden border-b ${TINT[o.kind] || "bg-tint-article"} ${hit || hovered ? "border-border-hover" : "border-default"} ${previewH === 135 ? "h-[135px]" : "h-[110px]"}`}>
+                    {o.image && !brokenImages.has(o.id) && !o.image.startsWith("data:application/") ? (
                       <img
                         src={o.image}
                         alt=""
                         draggable={false}
-                        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                        className="pointer-events-none absolute inset-0 h-full w-full object-cover"
                         onError={() => setBrokenImages((prev) => new Set(prev).add(o.id))}
                       />
                     ) : (
                       previewBars.map((b, i) => (
-                        <div key={i} style={{ position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, background: b.bg, borderRadius: b.r }} />
+                        <div
+                          key={i}
+                          className="absolute [left:var(--sd-l)] [top:var(--sd-t)] [width:var(--sd-w)] [height:var(--sd-h)] [border-radius:var(--sd-r)] [background:var(--sd-b)]"
+                          style={{ ["--sd-l" as string]: b.left, ["--sd-t" as string]: b.top, ["--sd-w" as string]: b.w, ["--sd-h" as string]: b.h, ["--sd-r" as string]: b.r, ["--sd-b" as string]: b.bg } as CSSProperties}
+                        />
                       ))
                     )}
+                    {o.kind === "pdf" && o.image && (
+                      <div className="absolute inset-0 grid place-items-center">
+                        <span className="rounded-md border border-strong bg-surface px-[9px] py-[5px] font-mono text-[9.5px] uppercase tracking-[.1em] text-muted">PDF</span>
+                      </div>
+                    )}
                     {o.playhead && (
-                      <div style={{ position: "relative", width: 30, height: 30, borderRadius: "50%", background: "var(--surface)", border: "1px solid rgba(var(--shadow-color),.14)", display: "grid", placeItems: "center" }}>
-                        <div style={{ width: 0, height: 0, borderLeft: "8px solid var(--text-secondary)", borderTop: "5px solid transparent", borderBottom: "5px solid transparent", marginLeft: 2 }} />
+                      <div className="relative grid size-[30px] place-items-center rounded-full border border-[rgba(var(--shadow-color),.14)] bg-surface">
+                        <div className="ml-0.5 h-0 w-0 border-b-[5px] border-l-8 border-t-[5px] border-b-transparent border-l-secondary border-t-transparent" />
                       </div>
                     )}
                   </div>
                 )}
 
                 {isText && (
-                  <div style={{ padding: "16px 17px 5px" }}>
+                  <div className="px-[17px] pb-[5px] pt-4">
                     {o.kind === "comment" ? (
                       autoFocusCommentId === o.id ? (
                         // A native <input>, scaled down with the rest of the
@@ -875,34 +1540,63 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                           onClick={(e) => e.stopPropagation()}
                           onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
                           onBlur={(e) => { void commitCommentTitle(o.id, e.target.value); setAutoFocusCommentId(null); }}
-                          style={{ width: "100%", border: "none", outline: "none", background: "none", fontFamily: SERIF, fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)" }}
+                          className="w-full border-none bg-transparent font-serif text-[19px] leading-[1.3] text-secondary outline-none"
                         />
                       ) : (
                         <div
                           onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => { e.stopPropagation(); setAutoFocusCommentId(o.id); }}
-                          style={{
-                            fontFamily: SERIF, fontSize: 19, lineHeight: 1.3, minHeight: "1.3em", cursor: "text",
-                            color: o.title ? "var(--text-secondary)" : "var(--text-faint)", textWrap: "pretty" as CSSProperties["textWrap"],
-                          }}
+                          className={`min-h-[1.3em] cursor-text font-serif text-[19px] leading-[1.3] text-pretty ${o.title ? "text-secondary" : "text-faint"}`}
                         >{o.title || "Write a comment…"}</div>
                       )
+                    ) : o.kind === "ask" ? (
+                      autoFocusAskId === o.id ? (
+                        <input
+                          defaultValue={o.title}
+                          placeholder="Ask anything…"
+                          disabled={askingIds.includes(o.id)}
+                          ref={(el) => { if (el) el.focus(); }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                          onBlur={(e) => { const q = e.target.value.trim(); setAutoFocusAskId(null); if (q && q !== o.title) void submitAsk(o.id, q); }}
+                          className="w-full border-none bg-transparent font-serif text-[19px] leading-[1.3] text-secondary outline-none"
+                        />
+                      ) : o.title ? (
+                        <div>
+                          <div
+                            onClick={(e) => { e.stopPropagation(); if (dragDistanceRef.current < 4) setAutoFocusAskId(o.id); }}
+                            className="cursor-text font-serif text-[19px] leading-[1.3] text-pretty text-secondary"
+                          >{o.title}</div>
+                          {askingIds.includes(o.id) && (
+                            <div className="mt-2 font-mono text-[10px] text-faint">asking…</div>
+                          )}
+                          {o.body && (
+                            <div className="mt-2 text-pretty whitespace-pre-wrap text-[13px] leading-[1.55] text-muted">{o.body}</div>
+                          )}
+                        </div>
+                      ) : (
+                        <div
+                          onClick={(e) => { e.stopPropagation(); if (dragDistanceRef.current < 4) setAutoFocusAskId(o.id); }}
+                          className="cursor-text font-serif text-[19px] leading-[1.3] text-faint"
+                        >{selectedIds.length ? `Ask about ${selectedIds.length} thing${selectedIds.length === 1 ? "" : "s"}…` : "Ask anything…"}</div>
+                      )
                     ) : (
-                      <div style={{ fontFamily: SERIF, fontStyle: o.kind === "quote" ? "italic" : "normal", fontSize: 19, lineHeight: 1.3, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.body}</div>
+                      <div className={`font-serif text-[19px] leading-[1.3] text-pretty text-secondary ${o.kind === "quote" ? "italic" : ""}`}>{o.body}</div>
                     )}
                   </div>
                 )}
 
-                <div style={{ padding: isText ? "5px 17px 16px" : "14px 16px 15px" }}>
-                  {o.kind !== "comment" && (
-                    <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", opacity: titleOp, textWrap: "pretty" as CSSProperties["textWrap"] }}>{o.title}</div>
+                <div className={isText ? "px-[17px] pb-4 pt-[5px]" : "px-4 pb-[15px] pt-3.5"}>
+                  {o.kind !== "comment" && o.kind !== "ask" && (
+                    <div className={`text-pretty text-sm font-medium leading-[1.3] text-primary ${titleDim ? "opacity-35" : ""}`}>{o.title}</div>
                   )}
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: o.kind === "comment" ? 0 : 6, opacity: titleOp }}>
-                    <span style={{ width: 10, height: 10, borderRadius: 2, background: MARK[o.kind] || "var(--text-muted)", flex: "none" }} />
-                    <span style={{ fontFamily: MONO, fontSize: 10.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.domain}</span>
+                  <div className={`flex items-center gap-[7px] ${o.kind === "comment" ? "" : "mt-1.5"} ${titleDim ? "opacity-35" : ""}`}>
+                    <span className="flex-none rounded size-[10px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: MARK[o.kind] || "var(--text-muted)" } as CSSProperties} />
+                    <span className="truncate font-mono text-[10.5px] text-faint">{o.domain}</span>
                   </div>
                   {hit != null && (
-                    <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 14.5, lineHeight: 1.3, color: "var(--text-muted)", marginTop: 9, paddingTop: 9, borderTop: "1px solid var(--border-subtle)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{matchLabel(hit)}</div>
+                    <div className="mt-[9px] border-t border-subtle pt-[9px] font-serif text-[14.5px] italic leading-[1.3] text-pretty text-muted">{matchLabel(hit)}</div>
                   )}
                 </div>
               </div>
@@ -912,26 +1606,25 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       </div>
 
       {isList && (
-        <div style={{ position: "absolute", inset: 0, background: PAPER, overflowY: "auto", zIndex: 10 }}>
-          <div style={{ maxWidth: 900, margin: "0 auto", padding: "92px 32px 90px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10, paddingBottom: 13, borderBottom: "1px solid var(--border-default)" }}>
-              <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase", color: "var(--text-muted)", flex: 1 }}>{items.length} things kept</div>
-              {[{ id: "pile" as const, label: "By pile" }, { id: "recent" as const, label: "Recent" }].map((t) => (
+        <div className="absolute inset-0 z-10 overflow-y-auto bg-paper">
+          <div className="mx-auto max-w-[900px] px-8 pb-[90px] pt-[92px]">
+            <div className="flex items-center gap-2.5 border-b border-default pb-[13px]">
+              <div className="flex-1 font-mono text-[10px] uppercase tracking-[.16em] text-muted">{items.length} things kept</div>
+              {[{ id: "folder" as const, label: "By folder" }, { id: "recent" as const, label: "Recent" }].map((t) => (
                 <button
                   key={t.id}
                   onClick={() => setSort(t.id)}
-                  className="sd-hover-fg"
-                  style={{ border: "none", background: "none", color: sort === t.id ? "var(--text-primary)" : "var(--text-faint)", fontSize: 12.5, fontWeight: sort === t.id ? 600 : 400, cursor: "pointer", padding: "4px 6px" }}
+                  className={`cursor-pointer border-none bg-transparent px-1.5 py-1 text-[12.5px] hover:text-primary ${sort === t.id ? "font-semibold text-primary" : "font-normal text-faint"}`}
                 >{t.label}</button>
               ))}
             </div>
 
             {listGroups.map((g) => (
               <div key={g.name}>
-                <div style={{ display: "flex", alignItems: "baseline", gap: 11, padding: "30px 2px 8px" }}>
-                  <div style={{ fontFamily: SERIF, fontSize: 22, letterSpacing: "-.01em", color: "var(--text-secondary)" }}>{g.name}</div>
-                  <div style={{ height: 1, flex: 1, background: "var(--border-subtle)" }} />
-                  <div style={{ fontFamily: MONO, fontSize: 10, color: "var(--text-fainter)" }}>{g.n}</div>
+                <div className="flex items-baseline gap-[11px] px-0.5 pb-2 pt-[30px]">
+                  <div className="font-serif text-[22px] tracking-[-.01em] text-secondary">{g.name}</div>
+                  <div className="h-px flex-1 bg-subtle" />
+                  <div className="font-mono text-[10px] text-fainter">{g.n}</div>
                 </div>
                 {g.items.map((r) => {
                   const hit = hits ? hits[r.id] ?? null : null;
@@ -943,25 +1636,15 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                       onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
                       onMouseEnter={() => setHoverId(r.id)}
                       onMouseLeave={() => setHoverId((h) => (h === r.id ? null : h))}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 15, padding: "12px 12px", borderRadius: 9, cursor: "pointer",
-                        opacity: hits && !hit ? 0.3 : 1,
-                        background: hovered ? "var(--hover-bg-alt)" : (hit ? "var(--accent-bg)" : "transparent"),
-                      }}
+                      className={`flex cursor-pointer items-center gap-[15px] rounded-[9px] px-3 py-3 ${hits && !hit ? "opacity-30" : ""} ${hovered ? "bg-hover-alt" : hit ? "bg-accent-bg" : "bg-transparent"}`}
                     >
-                      <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[r.kind] || "var(--text-muted)", flex: "none" }} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</div>
-                        <div style={{
-                          fontFamily: hit || hovered ? SERIF : MONO,
-                          fontStyle: hit || hovered ? "italic" : "normal",
-                          fontSize: hit || hovered ? 13.5 : 9.5,
-                          color: hit || hovered ? "var(--text-muted)" : "var(--text-faint)",
-                          marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                        }}>{rowSub(r, hit, hovered)}</div>
+                      <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: MARK[r.kind] || "var(--text-muted)" } as CSSProperties} />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[13.5px] font-medium text-primary">{r.title}</div>
+                        <div className={`mt-[3px] truncate ${hit || hovered ? "font-serif text-[13.5px] italic text-muted" : "font-mono text-[9.5px] text-faint"}`}>{rowSub(r, hit, hovered)}</div>
                       </div>
-                      <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-fainter)", flex: "none", width: 58, textAlign: "right" }}>{n ? n + (n === 1 ? " link" : " links") : ""}</div>
-                      <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)", flex: "none", width: 76, textAlign: "right" }}>{r.kept}</div>
+                      <div className="w-[58px] flex-none text-right font-mono text-[9.5px] text-fainter">{n ? n + (n === 1 ? " link" : " links") : ""}</div>
+                      <div className="w-[76px] flex-none text-right font-mono text-[9.5px] text-faint">{r.kept}</div>
                     </div>
                   );
                 })}
@@ -975,22 +1658,14 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
           scrolled underneath rather than each button floating on its own
           hard-edged pill. Masked to fade out at the bottom instead of
           ending in a hard line. */}
-      <div
-        style={{
-          position: "absolute", inset: "0 0 auto 0", height: 92, zIndex: 15, pointerEvents: "none",
-          backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
-          background: "linear-gradient(to bottom, rgba(var(--shadow-color),.05), rgba(var(--shadow-color),0))",
-          maskImage: "linear-gradient(to bottom, black 0%, black 55%, transparent 100%)",
-          WebkitMaskImage: "linear-gradient(to bottom, black 0%, black 55%, transparent 100%)",
-        }}
-      />
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-15 h-[92px] backdrop-blur-[10px] [background:linear-gradient(to_bottom,rgba(var(--shadow-color),.05),rgba(var(--shadow-color),0))] [mask-image:linear-gradient(to_bottom,black_0%,black_55%,transparent_100%)] [-webkit-mask-image:linear-gradient(to_bottom,black_0%,black_55%,transparent_100%)]" />
 
-      <div style={{ position: "absolute", left: 22, top: 20, display: "flex", alignItems: "center", gap: 11, zIndex: 20 }}>
-        <div style={{ width: 15, height: 15, borderRadius: 4, background: "var(--text-primary)", position: "relative" }}>
-          <div style={{ position: "absolute", right: -4, bottom: -4, width: 9, height: 9, borderRadius: 3, background: PAPER, border: "1px solid var(--text-primary)" }} />
+      <div className="absolute left-[22px] top-5 z-20 flex items-center gap-[11px]">
+        <div className="relative size-[15px] rounded bg-primary">
+          <div className="absolute -right-1 -bottom-1 size-[9px] rounded-[3px] border border-primary bg-paper" />
         </div>
-        <div style={{ fontFamily: MONO, fontSize: 10.5, letterSpacing: ".2em", textTransform: "uppercase", color: "var(--text-muted)" }}>Stashdrop</div>
-        <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, padding: 2, marginLeft: 6 }}>
+        <div className="font-mono text-[10.5px] uppercase tracking-[.2em] text-muted">Stashdrop</div>
+        <div className="ml-1.5 flex rounded-lg border border-default bg-surface p-0.5">
           {[{ id: "desk" as const, label: "Desk" }, { id: "list" as const, label: "List" }].map((v) => (
             <button
               key={v.id}
@@ -998,47 +1673,49 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 if (v.id === "list") { setView("list"); setFocusId(null); }
                 else { setView("desk"); setCamera(DEFAULT_CAMERA); setFocusId(null); }
               }}
-              className="sd-hover-fg"
-              style={{ border: "none", background: view === v.id ? "var(--hover-bg)" : "transparent", color: view === v.id ? "var(--text-primary)" : "var(--text-muted)", borderRadius: 6, padding: "6px 13px", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
+              className={`cursor-pointer rounded-md border-none px-[13px] py-1.5 text-[12.5px] font-medium hover:text-primary ${view === v.id ? "bg-hover text-primary" : "bg-transparent text-muted"}`}
             >{v.label}</button>
           ))}
         </div>
       </div>
 
-      <div style={{ position: "absolute", left: "50%", top: 16, transform: "translateX(-50%)", width: "min(560px, calc(100vw - 540px))", zIndex: 30 }}>
-        <div style={{
-          background: "var(--surface)", backdropFilter: "blur(12px)",
-          border: `1px solid ${barOpen ? "var(--border-strong)" : "var(--border-default)"}`,
-          borderRadius: barOpen ? 12 : 10,
-          boxShadow: barOpen ? "0 14px 40px rgba(var(--shadow-color),.11)" : "0 2px 10px rgba(var(--shadow-color),.05)",
-          overflow: "hidden", transition: "box-shadow .18s ease",
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "0 14px" }}>
-            <span style={{ fontFamily: MONO, fontSize: 12, color: "var(--text-faint)", flex: "none" }}>/</span>
+      {searchOpen && (
+        <div onClick={() => setSearchOpen(false)} className="fixed inset-0 z-60 animate-fade bg-overlay backdrop-blur-[4px]" />
+      )}
+
+      <div
+        ref={searchBarRef}
+        className={`${searchOpen
+          ? "fixed left-1/2 top-[42%] z-70 w-[min(680px,calc(100vw_-_40px))] -translate-x-1/2 -translate-y-1/2"
+          : "absolute left-1/2 top-4 z-30 w-[min(560px,calc(100vw_-_540px))] -translate-x-1/2"}`}
+      >
+        <div className={`overflow-hidden bg-surface backdrop-blur-[12px] ${searchOpen ? "rounded-[16px] border border-strong shadow-[0_28px_90px_rgba(var(--shadow-color),.2)]" : barOpen ? "rounded-[12px] border border-strong shadow-[0_14px_40px_rgba(var(--shadow-color),.11)]" : "rounded-[10px] border border-default shadow-[0_2px_10px_rgba(var(--shadow-color),.05)]"} [transition:box-shadow_.18s_ease]`}>
+          <div className={`flex items-center gap-[11px] ${searchOpen ? "px-4" : "px-3.5"}`}>
+            <span className={`flex-none font-mono ${searchOpen ? "text-sm" : "text-xs"} text-faint`}>/</span>
             <input
+              ref={searchInputRef}
               value={query}
               onChange={(e) => onChangeQuery(e.target.value)}
               onKeyDown={queryKey}
               readOnly={!!pendingState}
               placeholder="Search anything — or paste to keep it"
-              style={{ flex: 1, border: "none", outline: "none", background: "none", fontSize: 14.5, color: "var(--text-primary)", padding: "13px 0", cursor: pendingState ? "default" : "text" }}
+              className={`flex-1 border-none bg-transparent text-primary outline-none ${searchOpen ? "py-[17px] text-[17px]" : "py-[13px] text-[14.5px]"} ${pendingState ? "cursor-default" : "cursor-text"}`}
             />
             {query && (
               <button
                 onClick={() => { if (pendingState) { cancelPending(); } else { setQueryState(""); setSearchResults([]); } }}
-                className="sd-hover-fg"
-                style={{ border: "none", background: "none", color: "var(--text-faint)", fontFamily: MONO, fontSize: 12, cursor: "pointer", padding: 4 }}
+                className="cursor-pointer border-none bg-transparent p-1 font-mono text-xs text-faint hover:text-primary"
               >esc</button>
             )}
           </div>
 
           {query && !isUrl(query) && (
-            <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "9px 6px 8px" }}>
+            <div className="border-t border-subtle px-1.5 pb-2 pt-[9px]">
               {searching && !searchResults.length && (
-                <div style={{ padding: "8px 10px", fontFamily: MONO, fontSize: 11, color: "var(--text-faint)" }}>searching…</div>
+                <div className="px-2.5 py-2 font-mono text-[11px] text-faint">searching…</div>
               )}
               {!searching && !searchResults.length && (
-                <div style={{ padding: "8px 10px", fontFamily: MONO, fontSize: 11, color: "var(--text-faint)" }}>no matches</div>
+                <div className="px-2.5 py-2 font-mono text-[11px] text-faint">no matches</div>
               )}
               {searchResults.map((hit) => {
                 const it = items.find((o) => o.id === hit.id);
@@ -1046,13 +1723,12 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                 return (
                   <button
                     key={hit.id}
-                    onClick={() => { setFocusId(hit.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
-                    className="sd-hover-bg-alt"
-                    style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", border: "none", background: "none", borderRadius: 7, padding: "8px 10px", cursor: "pointer" }}
+                    onClick={() => { setFocusId(hit.id); setSearchOpen(false); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
+                    className="flex w-full cursor-pointer items-center gap-2.5 rounded-[7px] border-none bg-transparent px-2.5 py-2 text-left hover:bg-hover-alt"
                   >
-                    <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[it.kind] || "var(--text-muted)", flex: "none" }} />
-                    <span style={{ flex: 1, fontSize: 13.5, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.title}</span>
-                    <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-fainter)", flex: "none" }}>{Math.round(hit.score * 100)}%</span>
+                    <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: MARK[it.kind] || "var(--text-muted)" } as CSSProperties} />
+                    <span className="flex-1 truncate text-[13.5px] text-secondary">{it.title}</span>
+                    <span className="flex-none font-mono text-[9.5px] text-fainter">{Math.round(hit.score * 100)}%</span>
                   </button>
                 );
               })}
@@ -1060,109 +1736,89 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
           )}
 
           {pendingState && (
-            <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "13px 14px 12px", animation: "sd-slip .2s ease both" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                <span style={{ width: 9, height: 9, borderRadius: 2, background: pendingState.item ? MARK[pendingState.item.kind] : "var(--text-muted)", flex: "none" }} />
-                <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".05em", color: "var(--text-muted)" }}>{pendingState.host}</span>
-                <div style={{ flex: 1 }} />
-                <span style={{
-                  fontFamily: MONO, fontSize: 9.5, letterSpacing: ".06em", textTransform: "uppercase",
-                  color: pendingState.status === "reading" ? "var(--text-faint)" : "var(--text-muted)",
-                  animation: pendingState.status === "reading" ? "sd-breathe 1.3s ease-in-out infinite" : undefined,
-                }}>
+            <div className="animate-slip border-t border-subtle px-3.5 pb-3 pt-[13px]">
+              <div className="mb-3 flex items-center gap-2">
+                <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: pendingState.item ? MARK[pendingState.item.kind] : "var(--text-muted)" } as CSSProperties} />
+                <span className="font-mono text-[10px] tracking-[.05em] text-muted">{pendingState.host}</span>
+                <div className="flex-1" />
+                <span className={`font-mono text-[9.5px] uppercase tracking-[.06em] ${pendingState.status === "reading" ? "animate-breathe text-faint" : "text-muted"}`}>
                   {pendingState.status === "reading" ? "reading the page…" : pendingState.status === "error" ? "couldn't read it" : pendingState.item?.kind}
                 </span>
               </div>
-              <div style={{ display: "flex", gap: 13, alignItems: "flex-start" }}>
+              <div className="flex items-start gap-[13px]">
                 <div
                   ref={thumbRef}
-                  style={{
-                    width: 104, height: 74, flex: "none", position: "relative", overflow: "hidden", borderRadius: 8,
-                    border: "1px solid var(--border-default)",
-                    background: pendingState.status === "ready" && pendingState.item ? (TINT[pendingState.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
-                  }}
+                  className={`relative h-[74px] w-[104px] flex-none overflow-hidden rounded-lg border border-default ${pendingState.status === "ready" && pendingState.item ? (TINT[pendingState.item.kind] || "bg-tint-article") : "bg-hover"}`}
                 >
                   {pendingState.status === "ready" && pendingState.item?.image && !brokenImages.has(pendingState.item.id) ? (
                     <img
                       src={pendingState.item.image}
                       alt=""
                       draggable={false}
-                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                      className="pointer-events-none absolute inset-0 h-full w-full object-cover"
                       onError={() => setBrokenImages((prev) => new Set(prev).add(pendingState.item!.id))}
                     />
                   ) : (
                     bars(pendingState.status === "ready" && pendingState.item ? (pendingState.item.kind === "video" ? "image" : pendingState.item.kind) : "article", 7).map((b, i) => (
                       <div
                         key={i}
-                        style={{
-                          position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, borderRadius: b.r, background: b.bg,
-                          opacity: pendingState.status === "reading" ? 0.45 : 1,
-                          animation: pendingState.status === "reading" ? `sd-shimmer 1.2s ease-in-out ${i * 0.08}s infinite` : undefined,
-                        }}
+                        className={`absolute animate-shimmer [left:var(--sd-l)] [top:var(--sd-t)] [width:var(--sd-w)] [height:var(--sd-h)] [border-radius:var(--sd-r)] [background:var(--sd-b)] [animation-delay:var(--sd-d)] ${pendingState.status === "reading" ? "opacity-45" : ""}`}
+                        style={{ ["--sd-l" as string]: b.left, ["--sd-t" as string]: b.top, ["--sd-w" as string]: b.w, ["--sd-h" as string]: b.h, ["--sd-r" as string]: b.r, ["--sd-b" as string]: b.bg, ["--sd-d" as string]: `${i * 0.08}s` } as CSSProperties}
                       />
                     ))
                   )}
                 </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="min-w-0 flex-1">
                   {pendingState.status === "reading" && (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 7, paddingTop: 3 }}>
-                      <div style={{ height: 9, width: "72%", borderRadius: 3, background: "rgba(var(--ink-rgb),.13)", animation: "sd-shimmer 1.2s ease-in-out infinite" }} />
-                      <div style={{ height: 6, width: "94%", borderRadius: 3, background: "rgba(var(--ink-rgb),.08)", animation: "sd-shimmer 1.2s ease-in-out .15s infinite" }} />
-                      <div style={{ height: 6, width: "60%", borderRadius: 3, background: "rgba(var(--ink-rgb),.08)", animation: "sd-shimmer 1.2s ease-in-out .3s infinite" }} />
+                    <div className="flex flex-col gap-[7px] pt-[3px]">
+                      <div className="animate-shimmer h-[9px] w-[72%] rounded-[3px] [background:rgba(var(--ink-rgb),.13)]" />
+                      <div className="animate-shimmer h-[6px] w-[94%] rounded-[3px] [background:rgba(var(--ink-rgb),.08)] [animation-delay:.15s]" />
+                      <div className="animate-shimmer h-[6px] w-[60%] rounded-[3px] [background:rgba(var(--ink-rgb),.08)] [animation-delay:.3s]" />
                     </div>
                   )}
                   {pendingState.status === "error" && (
-                    <div style={{ fontSize: 13, color: "var(--danger)" }}>{pendingState.errorText}</div>
+                    <div className="text-[13px] text-danger">{pendingState.errorText}</div>
                   )}
                   {pendingState.status === "ready" && pendingState.item && (
                     <div>
-                      <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.3, color: "var(--text-primary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{pendingState.item.title}</div>
-                      <div style={{
-                        fontSize: 12.5, lineHeight: 1.5, color: "var(--text-muted)", marginTop: 5, textWrap: "pretty" as CSSProperties["textWrap"],
-                        display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden",
-                      }}>{pendingState.item.description}</div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 9 }}>
+                      <div className="text-pretty text-sm font-medium leading-[1.3] text-primary">{pendingState.item.title}</div>
+                      <div className="mt-[5px] line-clamp-3 text-pretty text-[12.5px] leading-[1.5] text-muted">{pendingState.item.description}</div>
+                      <div className="mt-[9px] flex flex-wrap gap-[5px]">
                         {pendingState.item.tags.map((t) => (
-                          <span key={t} style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-muted)", border: "1px solid var(--border-subtle)", borderRadius: 5, padding: "3px 7px" }}>{t}</span>
+                          <span key={t} className="rounded-[5px] border border-subtle px-[7px] py-[3px] font-mono text-[9.5px] text-muted">{t}</span>
                         ))}
                       </div>
                     </div>
                   )}
                 </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
-                <div style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 13, color: pendingState.status === "reading" ? "var(--text-fainter)" : "var(--text-muted)" }}>
+              <div className="mt-3.5 flex items-center gap-[9px] border-t border-subtle pt-3">
+                <div className={`font-serif text-[13px] italic ${pendingState.status === "reading" ? "text-fainter" : "text-muted"}`}>
                   {pendingState.status === "reading" ? "fetching page details" : pendingState.status === "ready" ? `lands next to ${pendingState.clusterName}` : ""}
                 </div>
-                <div style={{ flex: 1 }} />
+                <div className="flex-1" />
                 <button
                   onClick={cancelPending}
-                  className="sd-hover-border"
-                  style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-muted)", borderRadius: 7, padding: "6px 11px", fontSize: 12, cursor: "pointer" }}
+                  className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[11px] py-1.5 text-xs text-muted hover:border-primary"
                 >Discard</button>
                 <button
                   onClick={startPlacing}
                   disabled={pendingState.status !== "ready"}
-                  style={{
-                    border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)",
-                    borderRadius: 7, padding: "6px 13px", fontSize: 12, fontWeight: 500,
-                    cursor: pendingState.status === "ready" ? "pointer" : "not-allowed", opacity: pendingState.status === "ready" ? 1 : 0.45,
-                  }}
+                  className={`rounded-[7px] border border-primary bg-primary px-[13px] py-1.5 text-xs font-medium text-card ${pendingState.status === "ready" ? "cursor-pointer" : "cursor-not-allowed opacity-45"}`}
                 >Save</button>
               </div>
             </div>
           )}
 
           {ghostState && (
-            <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "11px 14px", display: "flex", alignItems: "center", gap: 9, animation: "sd-slip .2s ease both" }}>
-              <span style={{ width: 9, height: 9, borderRadius: 2, background: (ghostState.item && MARK[ghostState.item.kind]) || "var(--text-muted)", flex: "none" }} />
-              <div style={{ flex: 1, fontSize: 12.5, color: "var(--text-secondary)" }}>
+            <div className="flex animate-slip items-center gap-[9px] border-t border-subtle px-3.5 py-[11px]">
+              <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: (ghostState.item && MARK[ghostState.item.kind]) || "var(--text-muted)" } as CSSProperties} />
+              <div className="flex-1 text-[12.5px] text-secondary">
                 {ghostState.phase === "held" ? "Click the desk to put it down" : "Picking it up…"}
               </div>
               <button
                 onClick={cancelPending}
-                className="sd-hover-fg"
-                style={{ border: "none", background: "none", color: "var(--text-faint)", fontFamily: MONO, fontSize: 11, cursor: "pointer", padding: 4 }}
+                className="cursor-pointer border-none bg-transparent p-1 font-mono text-[11px] text-faint hover:text-primary"
               >esc</button>
             </div>
           )}
@@ -1176,244 +1832,465 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
         const ease = "cubic-bezier(.2,.8,.2,1)";
         const dx = anchored ? cursor[0] + 16 - g.rect!.left : 0;
         const dy = anchored ? cursor[1] + 14 - g.rect!.top : 0;
-        const heldT = `translate3d(${dx}px,${dy}px,0) scale(${camera.scale}) rotate(-1.5deg)`;
+        const ghostT = flying
+          ? `translate3d(0,0,0) scale(${g.rect!.width / 196})`
+          : `translate3d(${dx}px,${dy}px,0) scale(${camera.scale}) rotate(-1.5deg)`;
         const ghostBars = bars(g.item ? (g.item.kind === "video" ? "image" : g.item.kind) : "article", 7);
         return (
-          <div style={{
-            position: "fixed", width: 196, zIndex: 45, pointerEvents: "none",
-            left: anchored ? g.rect!.left : cursor[0] + 16,
-            top: anchored ? g.rect!.top : cursor[1] + 14,
-            transform: flying ? `translate3d(0,0,0) scale(${g.rect!.width / 196})` : heldT,
-            transformOrigin: "0 0",
-            opacity: flying ? 0.8 : 0.94,
-            transition: g.phase === "landing" ? `transform .42s ${ease}, opacity .42s ${ease}` : "none",
-            background: "var(--card-bg)", border: "1px solid var(--text-primary)",
-            borderRadius: 11, overflow: "hidden",
-            boxShadow: flying ? "0 8px 20px rgba(var(--shadow-color),.14)" : "0 22px 48px rgba(var(--shadow-color),.22)",
-          }}>
-            <div style={{
-              height: 96, position: "relative", overflow: "hidden", display: "grid", placeItems: "center",
-              borderBottom: "1px solid var(--border-default)",
-              background: g.item ? (TINT[g.item.kind] || "var(--tint-article)") : "var(--hover-bg)",
-            }}>
+          <div
+            className={`pointer-events-none fixed z-45 w-[196px] origin-top-left overflow-hidden rounded-[11px] border border-primary bg-card ${flying ? "opacity-80" : "opacity-[.94]"} [left:var(--sd-l)] [top:var(--sd-t)] [transform:var(--sd-tf)] [transition:var(--sd-tr)] [box-shadow:var(--sd-sh)]`}
+            style={{
+              ["--sd-l" as string]: `${anchored ? g.rect!.left : cursor[0] + 16}px`,
+              ["--sd-t" as string]: `${anchored ? g.rect!.top : cursor[1] + 14}px`,
+              ["--sd-tf" as string]: ghostT,
+              ["--sd-tr" as string]: g.phase === "landing" ? `transform .42s ${ease}, opacity .42s ${ease}` : "none",
+              ["--sd-sh" as string]: flying ? "0 8px 20px rgba(var(--shadow-color),.14)" : "0 22px 48px rgba(var(--shadow-color),.22)",
+            } as CSSProperties}
+          >
+            <div className={`relative grid h-24 place-items-center overflow-hidden border-b border-default ${g.item ? (TINT[g.item.kind] || "bg-tint-article") : "bg-hover"}`}>
               {g.item?.image && !brokenImages.has(g.item.id) ? (
                 <img
                   src={g.item.image}
                   alt=""
                   draggable={false}
-                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                  className="pointer-events-none absolute inset-0 h-full w-full object-cover"
                   onError={() => setBrokenImages((prev) => new Set(prev).add(g.item!.id))}
                 />
               ) : (
                 ghostBars.map((b, i) => (
-                  <div key={i} style={{ position: "absolute", left: b.left, top: b.top, width: b.w, height: b.h, borderRadius: b.r, background: b.bg }} />
+                  <div key={i} className="absolute [left:var(--sd-l)] [top:var(--sd-t)] [width:var(--sd-w)] [height:var(--sd-h)] [border-radius:var(--sd-r)] [background:var(--sd-b)]" style={{ ["--sd-l" as string]: b.left, ["--sd-t" as string]: b.top, ["--sd-w" as string]: b.w, ["--sd-h" as string]: b.h, ["--sd-r" as string]: b.r, ["--sd-b" as string]: b.bg } as CSSProperties} />
                 ))
               )}
             </div>
-            <div style={{ padding: "11px 13px 12px" }}>
-              <div style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.3, textWrap: "pretty" as CSSProperties["textWrap"], color: "var(--text-primary)" }}>{g.item?.title}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 5 }}>
-                <span style={{ width: 9, height: 9, borderRadius: 2, background: (g.item && MARK[g.item.kind]) || "var(--text-muted)", flex: "none" }} />
-                <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)" }}>{g.host}</span>
+            <div className="px-[13px] pb-3 pt-[11px]">
+              <div className="text-pretty text-[12.5px] font-medium leading-[1.3] text-primary">{g.item?.title}</div>
+              <div className="mt-[5px] flex items-center gap-1.5">
+                <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: (g.item && MARK[g.item.kind]) || "var(--text-muted)" } as CSSProperties} />
+                <span className="font-mono text-[9.5px] text-faint">{g.host}</span>
               </div>
             </div>
           </div>
         );
       })()}
 
-      <div style={{ position: "absolute", right: 22, top: 18, display: "flex", alignItems: "center", gap: 7, zIndex: 20 }}>
+      <div className="absolute right-[22px] top-[18px] z-20 flex items-center gap-[7px]">
+        {stash && (
+          <div className="relative">
+            <button
+              onClick={() => setStashMenuOpen((v) => !v)}
+              title="Switch or create a stash"
+              aria-label="Switch or create a stash"
+              className="flex max-w-[200px] cursor-pointer items-center gap-1.5 rounded-lg border border-default bg-surface px-2.5 py-2 text-[12.5px] text-muted hover:border-primary hover:text-primary"
+            >
+              <Layers size={14} />
+              <span className="truncate">{stash.name}</span>
+              <ChevronDown size={12} />
+            </button>
+            {stashMenuOpen && (
+              <>
+                <div onClick={() => setStashMenuOpen(false)} className="fixed inset-0 z-60" />
+                <div className="absolute right-0 top-[calc(100%+6px)] z-61 w-[236px] rounded-[10px] border border-default bg-card p-1.5 shadow-[0_14px_40px_rgba(var(--shadow-color),.16)]">
+                  <div className="px-[9px] pb-[5px] pt-[7px] font-mono text-[9.5px] uppercase tracking-[.14em] text-fainter">Stashes in {workspace.name}</div>
+                  <div className="max-h-[220px] overflow-y-auto">
+                    {stashes.map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => void handleSwitchStash(s.id)}
+                        disabled={stashBusy}
+                        className={`flex w-full items-center gap-2 rounded-md px-[9px] py-2 text-left text-[13px] hover:bg-hover-alt ${s.id === stash.id ? "cursor-default bg-hover text-primary" : "cursor-pointer bg-transparent text-secondary"}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate">{s.name}</span>
+                        {s.id === stash.id && <Check size={14} />}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-1.5 flex gap-1.5 border-t border-subtle pt-2">
+                    <input
+                      value={newStashName}
+                      onChange={(e) => setNewStashName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") void handleCreateStash(); }}
+                      placeholder="New stash name"
+                      className="min-w-0 flex-1 rounded-[7px] border border-default bg-hover-alt px-[9px] py-[7px] text-[12.5px] font-sans text-primary outline-none"
+                    />
+                    <button
+                      onClick={() => void handleCreateStash()}
+                      disabled={stashBusy || !newStashName.trim()}
+                      title="Create stash"
+                      aria-label="Create stash"
+                      className={`flex items-center rounded-[7px] border border-primary bg-primary px-2.5 text-card ${stashBusy || !newStashName.trim() ? "cursor-default opacity-50" : "cursor-pointer"}`}
+                    ><Plus size={14} /></button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
         <button
           onClick={() => setWorkspaceSwitcherOpen(true)}
           title="Switch workspace"
           aria-label="Switch workspace"
-          className="sd-hover-border-fg"
-          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12.5 }}
+          className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-default bg-surface px-2.5 py-2 text-[12.5px] text-muted hover:border-primary hover:text-primary"
         >{workspace.organizationId ? <Building2 size={14} /> : <UserIcon size={14} />} {workspace.name}</button>
         <button
           onClick={() => setSettingsOpen(true)}
-          title="Stash settings"
-          aria-label="Stash settings"
-          className="sd-hover-border-fg"
-          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer" }}
+          title="Workspace settings"
+          aria-label="Workspace settings"
+          className="flex cursor-pointer items-center rounded-lg border border-default bg-surface px-2.5 py-2 text-muted hover:border-primary hover:text-primary"
         ><SettingsIcon size={14} /></button>
-        <div style={{ position: "relative" }}>
+        <div className="relative">
           <button
             onClick={() => setThemeMenuOpen((v) => !v)}
             title="Theme"
             aria-label="Theme"
-            className="sd-hover-border-fg"
-            style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+            className="flex cursor-pointer items-center gap-1 rounded-lg border border-default bg-surface px-2.5 py-2 text-muted hover:border-primary hover:text-primary"
           >
             {theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}
             <ChevronDown size={12} />
           </button>
           {themeMenuOpen && (
             <>
-              <div onClick={() => setThemeMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 60 }} />
-              <div style={{
-                position: "absolute", right: 0, top: "calc(100% + 6px)", zIndex: 61, minWidth: 140,
-                background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10,
-                boxShadow: "0 10px 34px rgba(var(--shadow-color),.16)", overflow: "hidden", padding: 4,
-              }}>
+              <div onClick={() => setThemeMenuOpen(false)} className="fixed inset-0 z-60" />
+              <div className="absolute right-0 top-[calc(100%+6px)] z-61 min-w-[140px] overflow-hidden rounded-[10px] border border-default bg-card p-1 shadow-[0_10px_34px_rgba(var(--shadow-color),.16)]">
                 {([{ id: "system" as const, label: "Auto", Icon: Monitor }, { id: "light" as const, label: "Light", Icon: Sun }, { id: "dark" as const, label: "Dark", Icon: Moon }]).map((t) => (
                   <button
                     key={t.id}
                     onClick={() => { setTheme(t.id); setThemeMenuOpen(false); }}
-                    className="sd-hover-bg"
-                    style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: theme === t.id ? "var(--hover-bg)" : "none", color: theme === t.id ? "var(--text-primary)" : "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+                    className={`flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-[7px] text-left text-[12.5px] hover:bg-hover hover:text-primary ${theme === t.id ? "bg-hover text-primary" : "bg-transparent text-secondary"}`}
                   ><t.Icon size={13} /> {t.label}</button>
                 ))}
               </div>
             </>
           )}
         </div>
-        <UserMenu user={user} onSwitchWorkspace={() => setWorkspaceSwitcherOpen(true)} />
+        <UserMenu user={user} onSwitchWorkspace={() => setWorkspaceSwitcherOpen(true)} onOpenSettings={() => setSettingsOpen(true)} />
       </div>
 
-      {settingsOpen && <ProjectSettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal onClose={() => setSettingsOpen(false)} user={user} paperGrid={paperGrid} onSetPaperGrid={setPaperGrid} />
+      )}
       {workspaceSwitcherOpen && <WorkspaceSwitcher currentOrganizationId={workspace.organizationId} onClose={() => setWorkspaceSwitcherOpen(false)} />}
       {needsOnboarding && <Onboarding onComplete={() => router.refresh()} initialScope={onboardingInitialScope} organizationId={onboardingOrganizationId} />}
 
-      <div style={{ position: "absolute", left: 22, bottom: 20, display: "flex", alignItems: "center", gap: 6, zIndex: 20, opacity: isList ? 0 : 1, pointerEvents: isList ? "none" : "auto" }}>
-        <div style={{ display: "flex", alignItems: "center", background: "var(--surface)", border: "1px solid var(--border-default)", borderRadius: 8, overflow: "hidden" }}>
-          <button onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 0.85)} className="sd-hover-bg" style={{ border: "none", background: "none", color: "var(--text-muted)", width: 30, height: 30, cursor: "pointer", fontFamily: MONO, fontSize: 14 }}>−</button>
-          <button onClick={() => setCamera(DEFAULT_CAMERA)} className="sd-hover-bg" style={{ border: "none", background: "none", color: "var(--text-muted)", height: 30, padding: "0 9px", cursor: "pointer", fontFamily: MONO, fontSize: 10, borderLeft: "1px solid var(--border-subtle)", borderRight: "1px solid var(--border-subtle)", minWidth: 52 }}>{Math.round(camera.scale * 100)}%</button>
-          <button onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.18)} className="sd-hover-bg" style={{ border: "none", background: "none", color: "var(--text-muted)", width: 30, height: 30, cursor: "pointer", fontFamily: MONO, fontSize: 14 }}>+</button>
+      <div className={`absolute bottom-5 left-[22px] z-20 flex items-center gap-1.5 ${isList ? "pointer-events-none opacity-0" : ""}`}>
+        <div className="flex items-center overflow-hidden rounded-lg border border-default bg-surface">
+          <button onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 0.85)} className="size-[30px] cursor-pointer border-none bg-transparent font-mono text-sm text-muted hover:bg-hover hover:text-primary">−</button>
+          <button onClick={() => setCamera(DEFAULT_CAMERA)} className="h-[30px] min-w-[52px] cursor-pointer border-x border-subtle bg-transparent px-[9px] font-mono text-[10px] text-muted hover:bg-hover hover:text-primary">{Math.round(camera.scale * 100)}%</button>
+          <button onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.18)} className="size-[30px] cursor-pointer border-none bg-transparent font-mono text-sm text-muted hover:bg-hover hover:text-primary">+</button>
         </div>
-        <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-fainter)", paddingLeft: 6 }}>drag things around · scroll to zoom</div>
+        <div className="pl-1.5 font-mono text-[9.5px] text-fainter">drag things around · scroll to zoom</div>
       </div>
 
-      <div style={{ position: "absolute", right: 22, bottom: 20, zIndex: 30, display: "flex", alignItems: "center", gap: 7 }}>
+      {/* Right-edge toolbar: drag-out tools. Click one to pick it up — a
+          ghost follows the cursor until you click the desk to drop it. */}
+      <div className={`absolute right-3.5 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 ${isList ? "pointer-events-none opacity-0" : ""}`}>
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          title="Add an image from your computer"
+          aria-label="Add an image"
+          className="flex size-[34px] cursor-pointer items-center justify-center rounded-[9px] border border-default bg-surface text-muted shadow-[0_2px_10px_rgba(var(--shadow-color),.05)] hover:border-primary hover:text-primary"
+        ><ImagePlus size={16} /></button>
+        <button
+          onClick={beginPlacingComment}
+          title={placingComment ? "Click the desk to drop it (Esc to cancel)" : "Drop a comment on the board"}
+          aria-label="Drop a comment"
+          className={`flex size-[34px] cursor-pointer items-center justify-center rounded-[9px] text-muted shadow-[0_2px_10px_rgba(var(--shadow-color),.05)] hover:border-primary hover:text-primary ${placingComment ? "border border-primary bg-hover" : "border border-default bg-surface"}`}
+        ><StickyNote size={16} /></button>
+        <div className="relative">
+          <button
+            onClick={() => setFolderCreateOpen((v) => !v)}
+            title="Make a folder"
+            aria-label="Make a folder"
+            className={`flex size-[34px] cursor-pointer items-center justify-center rounded-[9px] text-muted shadow-[0_2px_10px_rgba(var(--shadow-color),.05)] hover:border-primary hover:text-primary ${folderCreateOpen ? "border border-primary bg-hover" : "border border-default bg-surface"}`}
+          ><FolderPlus size={16} /></button>
+          {folderCreateOpen && (
+            <div className="absolute right-[calc(100%+8px)] top-0 z-31 flex w-[190px] flex-col gap-2 rounded-[10px] border border-default bg-card p-2.5 shadow-[0_14px_40px_rgba(var(--shadow-color),.16)]">
+              <div className="font-mono text-[9.5px] uppercase tracking-[.14em] text-fainter">New folder</div>
+              <input
+                value={folderName}
+                onChange={(e) => setFolderName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void handleCreateFolder(); }}
+                placeholder="Folder name"
+                autoFocus
+                className="rounded-[7px] border border-default bg-hover-alt px-[9px] py-[7px] text-[12.5px] font-sans text-primary outline-none"
+              />
+              <button
+                onClick={() => void handleCreateFolder()}
+                disabled={!folderName.trim()}
+                className={`rounded-[7px] border border-primary bg-primary py-1.5 text-xs font-medium text-card ${folderName.trim() ? "cursor-pointer" : "cursor-not-allowed opacity-45"}`}
+              >Create</button>
+            </div>
+          )}
+        </div>
+        <button
+          onClick={() => beginPlacingAsk()}
+          title={placingAsk ? "Click the desk to ask it (Esc to cancel)" : "Ask anything — a question card answered on the desk"}
+          aria-label="Ask anything"
+          className={`flex size-[34px] cursor-pointer items-center justify-center rounded-[9px] text-muted shadow-[0_2px_10px_rgba(var(--shadow-color),.05)] hover:border-primary hover:text-primary ${placingAsk ? "border border-primary bg-hover" : "border border-default bg-surface"}`}
+        ><Sparkles size={16} /></button>
         <button
           onClick={openTrash}
           title="Trash"
           aria-label="Trash"
-          className="sd-hover-border-fg"
-          style={{ border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", borderRadius: 8, padding: "8px 10px", display: "flex", alignItems: "center", cursor: "pointer", boxShadow: "0 2px 10px rgba(var(--shadow-color),.05)" }}
-        ><Trash2 size={14} /></button>
-        <button
-          onClick={beginPlacingComment}
-          className="sd-hover-bg"
-          title={placingComment ? "Click the desk to drop it (Esc to cancel)" : "Drop a comment on the board"}
-          style={{
-            display: "flex", alignItems: "center", gap: 7,
-            border: `1px solid ${placingComment ? "var(--text-primary)" : "var(--border-default)"}`,
-            background: placingComment ? "var(--hover-bg)" : "var(--surface)", color: "var(--text-secondary)", borderRadius: 8, padding: "8px 13px",
-            fontSize: 12.5, cursor: "pointer", boxShadow: "0 2px 10px rgba(var(--shadow-color),.05)",
-          }}
-        ><span style={{ width: 9, height: 9, borderRadius: 2, background: MARK.comment, flex: "none" }} />{placingComment ? "Click the desk…" : "+ Comment"}</button>
+          className="flex size-[34px] cursor-pointer items-center justify-center rounded-[9px] border border-default bg-surface text-muted shadow-[0_2px_10px_rgba(var(--shadow-color),.05)] hover:border-primary hover:text-primary"
+        ><Trash2 size={16} /></button>
       </div>
 
+      <input ref={fileInputRef} type="file" accept="image/*,application/pdf" className="hidden" onChange={(e) => void handleFilePick(e)} />
+
       {placingComment && (
-        <div style={{
-          position: "fixed", left: cursor[0] + 16, top: cursor[1] + 14, width: 200, zIndex: 45, pointerEvents: "none",
-          transform: `scale(${camera.scale}) rotate(-1.5deg)`, transformOrigin: "0 0", opacity: 0.94,
-          background: "var(--sticky-bg)", border: "1px solid var(--sticky-border)", borderRadius: 11, overflow: "hidden",
-          boxShadow: "0 22px 48px rgba(var(--shadow-color),.22)",
-        }}>
-          <div style={{ padding: "16px 17px 5px" }}>
-            <div style={{ fontFamily: SERIF, fontSize: 19, color: "var(--text-faint)" }}>Write a comment…</div>
+        <div
+          className="pointer-events-none fixed z-45 w-[200px] origin-top-left overflow-hidden rounded-[11px] border border-sticky-border bg-sticky opacity-[.94] shadow-[0_22px_48px_rgba(var(--shadow-color),.22)] [left:var(--sd-l)] [top:var(--sd-t)] [transform:var(--sd-tf)]"
+          style={{ ["--sd-l" as string]: `${cursor[0] + 16}px`, ["--sd-t" as string]: `${cursor[1] + 14}px`, ["--sd-tf" as string]: `scale(${camera.scale}) rotate(-1.5deg)` } as CSSProperties}
+        >
+          <div className="px-[17px] pb-[5px] pt-4">
+            <div className="font-serif text-[19px] text-faint">Write a comment…</div>
           </div>
-          <div style={{ padding: "5px 17px 16px", display: "flex", alignItems: "center", gap: 7 }}>
-            <span style={{ width: 10, height: 10, borderRadius: 2, background: MARK.comment, flex: "none" }} />
-            <span style={{ fontFamily: MONO, fontSize: 10.5, color: "var(--text-faint)" }}>{user.name}</span>
+          <div className="flex items-center gap-[7px] px-[17px] pb-4 pt-[5px]">
+            <span className="flex-none rounded size-[10px] bg-[#B5860B]" />
+            <span className="font-mono text-[10.5px] text-faint">{user.name}</span>
+          </div>
+        </div>
+      )}
+
+      {placingAsk && (
+        <div
+          className="pointer-events-none fixed z-45 w-[220px] origin-top-left overflow-hidden rounded-[11px] border border-primary bg-card opacity-[.94] shadow-[0_22px_48px_rgba(var(--shadow-color),.22)] [left:var(--sd-l)] [top:var(--sd-t)] [transform:var(--sd-tf)]"
+          style={{ ["--sd-l" as string]: `${cursor[0] + 16}px`, ["--sd-t" as string]: `${cursor[1] + 14}px`, ["--sd-tf" as string]: `scale(${camera.scale}) rotate(-1deg)` } as CSSProperties}
+        >
+          <div className="px-[17px] py-[15px]">
+            <div className="font-serif text-[19px] text-faint">
+              {selectedIds.length ? `Ask about ${selectedIds.length} thing${selectedIds.length === 1 ? "" : "s"}…` : "Ask anything…"}
+            </div>
+            <div className="mt-[7px] font-mono text-[10px] text-fainter">answered on the desk by your local model</div>
           </div>
         </div>
       )}
 
       {capture && (
-        <div style={{
-          position: "absolute", left: "50%", bottom: 26, transform: "translateX(-50%)", zIndex: 40,
-          background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10, boxShadow: "0 10px 34px rgba(var(--shadow-color),.1)",
-          padding: "11px 15px", display: "flex", alignItems: "center", gap: 12, animation: "sd-rise .22s ease both",
-        }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: capture.dot, animation: capture.anim }} />
-          <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>{capture.text}</div>
+        <div className="absolute bottom-[26px] left-1/2 z-40 flex -translate-x-1/2 animate-rise items-center gap-3 rounded-[10px] border border-default bg-card px-[15px] py-[11px] shadow-[0_10px_34px_rgba(var(--shadow-color),.1)]">
+          <div className="size-[7px] rounded-full [background:var(--sd-dot)]" style={{ ["--sd-dot" as string]: capture.dot } as CSSProperties} />
+          <div className="text-[13px] text-secondary">{capture.text}</div>
           {capture.where && (
-            <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)", borderLeft: "1px solid var(--border-subtle)", paddingLeft: 12 }}>{capture.where}</div>
+            <div className="border-l border-subtle pl-3 font-mono text-[9.5px] text-faint">{capture.where}</div>
           )}
+        </div>
+      )}
+
+      {marquee && (
+        <div
+          className="pointer-events-none fixed z-44 rounded border border-muted bg-[rgba(var(--shadow-color),.05)] [left:var(--sd-l)] [top:var(--sd-t)] [width:var(--sd-w)] [height:var(--sd-h)]"
+          style={{
+            ["--sd-l" as string]: `${marquee.x0 * camera.scale + camera.tx}px`,
+            ["--sd-t" as string]: `${marquee.y0 * camera.scale + camera.ty}px`,
+            ["--sd-w" as string]: `${(marquee.x1 - marquee.x0) * camera.scale}px`,
+            ["--sd-h" as string]: `${(marquee.y1 - marquee.y0) * camera.scale}px`,
+          } as CSSProperties}
+        />
+      )}
+
+      {selectedIds.length > 0 && !isList && (
+        <div className="absolute left-1/2 top-[104px] z-40 flex -translate-x-1/2 items-center gap-2 rounded-[10px] border border-default bg-card px-2 py-1.5 shadow-[0_12px_36px_rgba(var(--shadow-color),.14)]">
+          <span className="px-1 font-mono text-[10px] text-faint">{selectedIds.length} selected</span>
+          <span className="h-4 w-px bg-subtle" />
+          <button
+            onClick={() => beginPlacingAsk(selectedIds)}
+            className="flex cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-[9px] py-1.5 text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+          ><Sparkles size={13} /> Ask</button>
+          <button
+            className="flex cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-[9px] py-1.5 text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+          ><FolderInput size={13} />
+            <select
+              value=""
+              onChange={(e) => { if (e.target.value) void bulkMoveSelected(e.target.value); }}
+              onClick={(e) => e.stopPropagation()}
+              className="cursor-pointer border-none bg-transparent font-sans text-[12.5px] text-secondary outline-none"
+            >
+              <option value="">Move to folder…</option>
+              {clusterList.map(({ key, name }) => <option key={key} value={key}>{name}</option>)}
+            </select>
+          </button>
+          <button
+            onClick={() => void bulkTrashSelected()}
+            className="flex cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-[9px] py-1.5 text-[12.5px] text-danger hover:bg-hover hover:text-primary"
+          ><Trash2 size={13} /> Delete</button>
+          <button
+            onClick={() => setSelectedIds([])}
+            title="Clear selection"
+            className="cursor-pointer rounded-md border-none bg-transparent px-[7px] py-1.5 font-mono text-[11px] text-faint hover:bg-hover hover:text-primary"
+          >esc</button>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed bottom-[62px] left-1/2 z-46 flex -translate-x-1/2 animate-rise items-center gap-3 rounded-[10px] border border-default bg-card px-3.5 py-2.5 shadow-[0_10px_34px_rgba(var(--shadow-color),.14)]">
+          <div className="text-[13px] text-secondary">{toast.text}</div>
+          <button
+            onClick={() => void undoTrash()}
+            className="cursor-pointer rounded-[7px] border border-primary bg-primary px-[11px] py-[5px] text-xs font-medium text-card"
+          >Undo</button>
         </div>
       )}
 
       {contextMenu && contextMenuItem && (
         <>
           <div
-            onClick={() => setContextMenu(null)}
-            onContextMenu={(e) => { e.preventDefault(); setContextMenu(null); }}
-            style={{
-              position: "fixed", inset: 0, zIndex: 60,
-              background: "rgba(0,0,0,.18)",
-              animation: "sd-fade .16s ease-out both",
-            }}
+            onClick={closeContextMenu}
+            onContextMenu={(e) => { e.preventDefault(); closeContextMenu(); }}
+            className="fixed inset-0 z-60 animate-fade bg-[rgba(0,0,0,.18)]"
           />
-          <div style={{
-            position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 63, minWidth: 180, maxWidth: 260,
-            background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 10,
-            boxShadow: "0 10px 34px rgba(var(--shadow-color),.16)", overflow: "hidden", padding: 4,
-          }}>
-            <div style={{ padding: "7px 10px", fontSize: 12, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", borderBottom: "1px solid var(--border-subtle)", marginBottom: 4 }}>{contextMenuItem.title}</div>
+          <div
+            className="fixed z-63 min-w-[180px] max-w-[260px] overflow-hidden rounded-[10px] border border-default bg-card p-1 shadow-[0_10px_34px_rgba(var(--shadow-color),.16)] [left:var(--sd-l)] [top:var(--sd-t)]"
+            style={{ ["--sd-l" as string]: `${contextMenu.x}px`, ["--sd-t" as string]: `${contextMenu.y}px` } as CSSProperties}
+          >
+            <div className="mb-1 truncate border-b border-subtle px-2.5 py-[7px] text-xs font-medium text-primary">{contextMenuItem.title}</div>
             <button
-              onClick={() => { openInEditRef.current = true; setFocusId(contextMenuItem.id); setContextMenu(null); }}
-              className="sd-hover-bg"
-              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--text-secondary)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+              onClick={() => { setOpenInEdit(true); setFocusId(contextMenuItem.id); closeContextMenu(); }}
+              className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
             ><Pencil size={13} /> Edit</button>
+            {contextMenuItem.cluster && (
+              <button
+                onClick={() => { removeFromFolder(contextMenuItem.id); closeContextMenu(); }}
+                className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+              ><FolderMinus size={13} /> Remove from folder</button>
+            )}
+            {stashes.length > 1 && (
+              <>
+                <button
+                  onClick={() => setMoveMenuOpen((v) => !v)}
+                  className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+                ><FolderInput size={13} /> Move to<span className="flex-1" /><ChevronDown size={11} className={`${moveMenuOpen ? "rotate-180" : ""}`} /></button>
+                {moveMenuOpen && (
+                  <div className="my-0.5 max-h-[180px] overflow-y-auto border-y border-subtle py-0.5">
+                    {stashes.filter((s) => s.id !== stash?.id).map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => void moveToStash(contextMenuItem.id, s.id, s.name)}
+                        className="flex w-full cursor-pointer items-center truncate rounded-md border-none bg-transparent py-[7px] pl-[22px] pr-2.5 text-left text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+                      >{s.name}</button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
             {canDeleteItem(contextMenuItem) && (
               <button
                 onClick={() => void quickTrash(contextMenuItem.id)}
-                className="sd-hover-bg"
-                style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", border: "none", background: "none", color: "var(--danger)", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, cursor: "pointer", textAlign: "left" }}
+                className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-danger hover:bg-hover hover:text-primary"
               ><Trash2 size={13} /> Delete</button>
             )}
           </div>
         </>
       )}
 
+      {folderMenu && (
+        <>
+          <div
+            onClick={() => setFolderMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setFolderMenu(null); }}
+            className="fixed inset-0 z-60 animate-fade bg-[rgba(0,0,0,.18)]"
+          />
+          <div
+            className="fixed z-63 min-w-[180px] max-w-[260px] overflow-hidden rounded-[10px] border border-default bg-card p-1 shadow-[0_10px_34px_rgba(var(--shadow-color),.16)] [left:var(--sd-l)] [top:var(--sd-t)]"
+            style={{ ["--sd-l" as string]: `${folderMenu.x}px`, ["--sd-t" as string]: `${folderMenu.y}px` } as CSSProperties}
+          >
+            <div className="mb-1 truncate border-b border-subtle px-2.5 py-[7px] text-xs font-medium text-primary">{clusterNames[folderMenu.key] || "Folder"}</div>
+            <button
+              onClick={() => { setFolderRenameKey(folderMenu.key); setFolderRename(clusterNames[folderMenu.key] || ""); setFolderMenu(null); }}
+              className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-secondary hover:bg-hover hover:text-primary"
+            ><Pencil size={13} /> Edit</button>
+            <button
+              onClick={() => { setDeleteFolderKey(folderMenu.key); setFolderMenu(null); }}
+              className="flex w-full cursor-pointer items-center gap-2 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left text-[12.5px] text-danger hover:bg-hover hover:text-primary"
+            ><Trash2 size={13} /> Delete</button>
+          </div>
+        </>
+      )}
+
+      {folderRenameKey && (
+        <div onClick={() => setFolderRenameKey(null)} className="fixed inset-0 z-70 grid place-items-center bg-overlay px-6 backdrop-blur-[2px]">
+          <div onClick={(e) => e.stopPropagation()} className="w-[min(360px,100%)] animate-sheet overflow-hidden rounded-[14px] border border-default bg-card p-5 shadow-[0_24px_70px_rgba(var(--shadow-color),.16)]">
+            <div className="font-serif text-[19px] text-primary">Rename folder</div>
+            <input
+              value={folderRename}
+              onChange={(e) => setFolderRename(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void saveFolderRename(); }}
+              placeholder="Folder name"
+              autoFocus
+              className="mt-4 w-full rounded-[7px] border border-default bg-hover-alt px-[10px] py-[8px] text-[13px] text-primary outline-none"
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => setFolderRenameKey(null)}
+                className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[13px] py-1.5 text-[12.5px] text-secondary hover:border-primary"
+              >Cancel</button>
+              <button
+                onClick={() => void saveFolderRename()}
+                disabled={!folderRename.trim()}
+                className={`rounded-[7px] border border-primary bg-primary px-[13px] py-1.5 text-[12.5px] text-card ${folderRename.trim() ? "cursor-pointer" : "cursor-not-allowed opacity-45"}`}
+              >Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteFolderKey && (
+        <div className="fixed inset-0 z-75 grid place-items-center bg-overlay px-6">
+          <div className="w-[min(400px,100%)] animate-sheet overflow-hidden rounded-[14px] border border-default bg-card p-5 shadow-[0_24px_70px_rgba(var(--shadow-color),.2)]">
+            <div className="font-serif text-[20px] text-primary">Delete “{clusterNames[deleteFolderKey] || "folder"}”?</div>
+            <div className="mt-1.5 text-[13px] leading-[1.5] text-muted">
+              {(() => { const n = items.filter((o) => o.cluster === deleteFolderKey).length; return n ? `It holds ${n} item${n === 1 ? "" : "s"}. What should happen to them?` : "It's empty — just remove the folder?"; })()}
+            </div>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                onClick={() => setDeleteFolderKey(null)}
+                className="cursor-pointer rounded-[9px] border border-strong bg-transparent px-[13px] py-2 text-[13px] text-secondary hover:border-primary"
+              >Cancel</button>
+              <button
+                onClick={() => void handleDeleteFolder("keep")}
+                className="cursor-pointer rounded-[9px] border border-primary bg-primary px-[13px] py-2 text-[13px] text-card"
+              >Keep the items</button>
+              <button
+                onClick={() => void handleDeleteFolder("delete")}
+                className="cursor-pointer rounded-[9px] border border-danger bg-danger-bg px-[13px] py-2 text-[13px] text-danger"
+              >Delete the folder and all {items.filter((o) => o.cluster === deleteFolderKey).length} items</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {trashOpen && (
         <div
           onClick={() => setTrashOpen(false)}
-          style={{
-            position: "absolute", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(2px)", zIndex: 50,
-            display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "7vh 24px 24px", overflowY: "auto",
-          }}
+          className="absolute inset-0 z-50 flex items-start justify-center overflow-y-auto bg-overlay px-6 pb-6 pt-[7vh] backdrop-blur-[2px]"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            style={{
-              width: "min(520px, 100%)", background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 14,
-              boxShadow: "0 24px 70px rgba(var(--shadow-color),.14)", overflow: "hidden", animation: "sd-sheet .24s cubic-bezier(.2,.8,.2,1) both",
-            }}
+            className="w-[min(520px,100%)] animate-sheet overflow-hidden rounded-[14px] border border-default bg-card shadow-[0_24px_70px_rgba(var(--shadow-color),.14)] [animation-duration:.24s]"
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "18px 22px", borderBottom: "1px solid var(--border-subtle)" }}>
-              <div style={{ fontFamily: SERIF, fontSize: 19, color: "var(--text-primary)", flex: 1 }}>Trash</div>
+            <div className="flex items-center gap-2.5 border-b border-subtle px-[22px] py-[18px]">
+              <div className="flex-1 font-serif text-[19px] text-primary">Trash</div>
               {trashItems.length > 0 && (
                 <button
                   onClick={handleEmptyTrash}
-                  style={{
-                    border: `1px solid ${emptyArmed ? "var(--danger)" : "var(--border-strong)"}`,
-                    background: emptyArmed ? "var(--danger-bg)" : "none",
-                    color: emptyArmed ? "var(--danger)" : "var(--text-secondary)",
-                    borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
-                  }}
+                  className={`cursor-pointer rounded-[7px] border px-[11px] py-[5px] text-xs ${emptyArmed ? "border-danger bg-danger-bg text-danger" : "border-strong bg-transparent text-secondary"}`}
                 >{emptyArmed ? "Confirm empty?" : "Empty trash"}</button>
               )}
             </div>
-            <div style={{ maxHeight: "60vh", overflowY: "auto", padding: "6px 10px" }}>
+            <div className="max-h-[60vh] overflow-y-auto px-2.5 py-1.5">
               {trashItems.length === 0 ? (
-                <div style={{ padding: "28px 12px", textAlign: "center", fontSize: 13, color: "var(--text-faint)" }}>Nothing in the trash.</div>
+                <div className="px-3 py-7 text-center text-[13px] text-faint">Nothing in the trash.</div>
               ) : (
                 trashItems.map((t) => (
                   <div
                     key={t.id}
                     onClick={() => { setFocusId(t.id); setDisc({ highlights: false, related: false, context: false, comments: false }); setTrashOpen(false); }}
-                    className="sd-hover-bg-alt"
-                    style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, cursor: "pointer" }}
+                    className="flex cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2.5 hover:bg-hover-alt"
                   >
-                    <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[t.kind] || "var(--text-muted)", flex: "none" }} />
-                    <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</div>
+                    <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: MARK[t.kind] || "var(--text-muted)" } as CSSProperties} />
+                    <div className="min-w-0 flex-1 truncate text-[13.5px] text-primary">{t.title}</div>
                     <button
                       onClick={(e) => { e.stopPropagation(); handleRestore(t); }}
-                      className="sd-hover-border"
-                      style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "4px 10px", fontSize: 12, cursor: "pointer", flex: "none" }}
+                      className="cursor-pointer flex-none rounded-[7px] border border-strong bg-transparent px-2.5 py-1 text-xs text-secondary hover:border-primary"
                     >Restore</button>
                   </div>
                 ))
@@ -1426,47 +2303,38 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
       {focused && (
         <div
           onClick={() => setFocusId(null)}
-          style={{
-            position: "absolute", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(2px)", zIndex: 50,
-            display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "7vh 24px 24px", overflowY: "auto",
-          }}
+          className="absolute inset-0 z-50 flex items-start justify-center overflow-y-auto bg-overlay px-6 pb-6 pt-[7vh] backdrop-blur-[2px]"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            style={{
-              width: "min(680px, 100%)", background: "var(--card-bg)", border: "1px solid var(--border-default)", borderRadius: 14,
-              boxShadow: "0 24px 70px rgba(var(--shadow-color),.14)", overflow: "hidden", animation: "sd-sheet .24s cubic-bezier(.2,.8,.2,1) both",
-            }}
+            className="w-[min(680px,100%)] animate-sheet overflow-hidden rounded-[14px] border border-default bg-card shadow-[0_24px_70px_rgba(var(--shadow-color),.14)] [animation-duration:.24s]"
           >
-            <div style={{
-              height: focused.kind === "comment" ? 60 : focused.isText ? 200 : (focused.kind === "image" || focused.kind === "shot" ? 300 : 220),
-              background: focused.kind === "comment" ? "var(--sticky-bg)" : TINT[focused.kind] || "var(--tint-article)", borderBottom: "1px solid var(--border-subtle)", position: "relative", display: "grid", placeItems: "center", overflow: "hidden",
-            }}>
-              {!focused.isText && focused.image && !brokenImages.has(focused.id) ? (
+            <div className={`relative grid place-items-center overflow-hidden border-b border-subtle ${focused.kind === "comment" ? "h-[60px] bg-sticky" : `${focused.isText ? "h-[200px]" : focused.kind === "image" || focused.kind === "shot" ? "h-[300px]" : "h-[220px]"} ${TINT[focused.kind] || "bg-tint-article"}`}`}>
+              {!focused.isText && focused.image && !brokenImages.has(focused.id) && !focused.image.startsWith("data:application/") ? (
                 <img
                   src={focused.image}
                   alt=""
                   draggable={false}
-                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+                  className="pointer-events-none absolute inset-0 h-full w-full object-cover"
                   onError={() => setBrokenImages((prev) => new Set(prev).add(focused.id))}
                 />
               ) : (
                 !focused.isText && bars(focused.kind === "video" ? "image" : focused.kind, (focused.id.charCodeAt(1) || 3) + 1).map((b, i) => (
-                  <div key={i} style={{
-                    position: "absolute", left: b.left, top: b.top, width: b.w,
-                    height: b.h === "3px" ? "5px" : b.h === "7px" ? "11px" : b.h,
-                    background: b.bg, borderRadius: b.r,
-                  }} />
+                  <div
+                    key={i}
+                    className="absolute [left:var(--sd-l)] [top:var(--sd-t)] [width:var(--sd-w)] [height:var(--sd-h)] [border-radius:var(--sd-r)] [background:var(--sd-b)]"
+                    style={{ ["--sd-l" as string]: b.left, ["--sd-t" as string]: b.top, ["--sd-w" as string]: b.w, ["--sd-h" as string]: b.h === "3px" ? "5px" : b.h === "7px" ? "11px" : b.h, ["--sd-r" as string]: b.r, ["--sd-b" as string]: b.bg } as CSSProperties}
+                  />
                 ))
               )}
               {focused.isText && focused.kind !== "comment" && (
-                <div style={{ padding: "34px 40px", maxWidth: 520 }}>
-                  <div style={{ fontFamily: SERIF, fontStyle: focused.kind === "quote" ? "italic" : "normal", fontSize: 26, lineHeight: 1.28, color: "var(--text-primary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.body}</div>
+                <div className="max-w-[520px] px-10 py-[34px]">
+                  <div className={`text-pretty font-serif text-[26px] leading-[1.28] text-primary ${focused.kind === "quote" ? "italic" : ""}`}>{focused.body}</div>
                 </div>
               )}
               {focused.playhead && (
-                <div style={{ width: 44, height: 44, borderRadius: "50%", background: "var(--surface)", border: "1px solid rgba(var(--shadow-color),.14)", display: "grid", placeItems: "center" }}>
-                  <div style={{ width: 0, height: 0, borderLeft: "12px solid var(--text-secondary)", borderTop: "7.5px solid transparent", borderBottom: "7.5px solid transparent", marginLeft: 3 }} />
+                <div className="grid size-11 place-items-center rounded-full border border-[rgba(var(--shadow-color),.14)] bg-surface">
+                  <div className="ml-[3px] h-0 w-0 border-b-[7.5px] border-l-[12px] border-t-[7.5px] border-b-transparent border-l-secondary border-t-transparent" />
                 </div>
               )}
               {focused.url && (
@@ -1474,74 +2342,69 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                   href={focused.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="sd-hover-border-fg"
-                  style={{ position: "absolute", left: 12, top: 12, height: 26, padding: "0 10px", borderRadius: 7, border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-secondary)", cursor: "pointer", fontFamily: MONO, fontSize: 11, display: "flex", alignItems: "center", gap: 5, textDecoration: "none" }}
+                  className="absolute left-3 top-3 flex h-[26px] cursor-pointer items-center gap-[5px] rounded-[7px] border border-default bg-surface px-2.5 font-mono text-[11px] text-secondary no-underline hover:border-primary hover:text-primary"
                 >open ↗</a>
               )}
               <button
                 onClick={() => setFocusId(null)}
-                className="sd-hover-border-fg"
-                style={{ position: "absolute", right: 12, top: 12, width: 26, height: 26, borderRadius: 7, border: "1px solid var(--border-default)", background: "var(--surface)", color: "var(--text-muted)", cursor: "pointer", fontFamily: MONO, fontSize: 11 }}
+                className="absolute right-3 top-3 size-[26px] cursor-pointer rounded-[7px] border border-default bg-surface font-mono text-[11px] text-muted hover:border-primary hover:text-primary"
               >✕</button>
             </div>
 
-            <div style={{ padding: "22px 26px 8px" }}>
-              <h2 style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 27, lineHeight: 1.2, margin: "0 0 8px", letterSpacing: "-.01em", textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.title}</h2>
-              <div style={{ display: "flex", alignItems: "center", gap: 9, fontFamily: MONO, fontSize: 10, color: "var(--text-faint)", flexWrap: "wrap" }}>
-                <span style={{ width: 9, height: 9, borderRadius: 2, background: MARK[focused.kind] || "var(--text-muted)" }} />
-                <span>{focused.domain}</span><span>·</span><span>kept {focused.kept}</span><span>·</span><span>{(CLUSTERS[focused.cluster] || { name: "Unsorted" }).name}</span>
+            <div className="px-[26px] pb-2 pt-[22px]">
+              <h2 className="m-0 mb-2 text-pretty font-serif text-[27px] font-normal leading-[1.2] tracking-[-.01em]">{focused.title}</h2>
+              <div className="flex flex-wrap items-center gap-[9px] font-mono text-[10px] text-faint">
+                <span className="rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: MARK[focused.kind] || "var(--text-muted)" } as CSSProperties} />
+                <span>{focused.domain}</span><span>·</span><span>kept {focused.kept}</span><span>·</span><span>{clusterNames[focused.cluster] || "Unsorted"}</span>
                 {focused.createdByName && <><span>·</span><span>added by {focused.createdByName}</span></>}
               </div>
             </div>
 
-            <div style={{ padding: "14px 26px 0" }}>
-              <div style={{ fontSize: 14.5, lineHeight: 1.6, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.description}</div>
+            <div className="px-[26px] pt-3.5">
+              <div className="text-pretty text-[14.5px] leading-[1.6] text-secondary">{focused.description}</div>
             </div>
 
-            <div style={{ padding: "18px 26px 6px", display: "flex", flexWrap: "wrap", gap: 6 }}>
+            <div className="flex flex-wrap gap-1.5 px-[26px] pb-1.5 pt-[18px]">
               {focused.tags.map((t) => (
-                <span key={t} style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-muted)", border: "1px solid var(--border-subtle)", borderRadius: 5, padding: "3px 8px" }}>{t}</span>
+                <span key={t} className="rounded-[5px] border border-subtle px-2 py-[3px] font-mono text-[9.5px] text-muted">{t}</span>
               ))}
             </div>
 
             {!editing && (
-              <div style={{ padding: "10px 26px 0", display: "flex", gap: 8 }}>
+              <div className="flex gap-2 px-[26px] pt-2.5">
                 {focused.url ? (
                   <a
                     href={focused.url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="sd-hover-border"
-                    style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer", textDecoration: "none" }}
+                    className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[11px] py-[5px] text-xs text-secondary no-underline hover:border-primary"
                   >Open original ↗</a>
+                ) : focused.kind === "pdf" && focused.image ? (
+                  <button
+                    onClick={() => openPdf(focused.image!)}
+                    className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[11px] py-[5px] text-xs text-secondary hover:border-primary"
+                  >Open PDF ↗</button>
                 ) : (
                   <span
                     title="This item has no source link — it's original demo content, not something pasted in"
-                    style={{ border: "1px solid var(--border-subtle)", color: "var(--text-fainter)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "not-allowed" }}
+                    className="cursor-not-allowed rounded-[7px] border border-subtle px-[11px] py-[5px] text-xs text-fainter"
                   >Open original ↗</span>
                 )}
                 {focusedTrashed ? (
                   <button
                     onClick={() => { void handleRestore(focused); setFocusId(null); }}
-                    className="sd-hover-border"
-                    style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
+                    className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[11px] py-[5px] text-xs text-secondary hover:border-primary"
                   >Restore</button>
                 ) : (
                   <>
                     <button
                       onClick={() => { setEditing(true); setDeleteArmed(false); }}
-                      className="sd-hover-border"
-                      style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer" }}
+                      className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[11px] py-[5px] text-xs text-secondary hover:border-primary"
                     >Edit</button>
                     {canDeleteItem(focused) && (
                       <button
                         onClick={() => confirmDelete(focused.id)}
-                        style={{
-                          border: `1px solid ${deleteArmed ? "var(--danger)" : "var(--border-strong)"}`,
-                          background: deleteArmed ? "var(--danger-bg)" : "none",
-                          color: deleteArmed ? "var(--danger)" : "var(--text-secondary)",
-                          borderRadius: 7, padding: "5px 11px", fontSize: 12, cursor: "pointer",
-                        }}
+                        className={`cursor-pointer rounded-[7px] border px-[11px] py-[5px] text-xs ${deleteArmed ? "border-danger bg-danger-bg text-danger" : "border-strong bg-transparent text-secondary"}`}
                       >{deleteArmed ? "Confirm delete?" : "Delete"}</button>
                     )}
                   </>
@@ -1550,118 +2413,116 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
             )}
 
             {editing && focused.kind === "comment" && (
-              <div style={{ padding: "14px 26px 0", display: "flex", flexDirection: "column", gap: 10 }}>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+              <div className="flex flex-col gap-2.5 px-[26px] pt-3.5">
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Title
                   <input
                     value={editTitle}
                     onChange={(e) => setEditTitle(e.target.value)}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)" }}
+                    className="rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] text-primary"
                   />
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Description
                   <textarea
                     value={editDescription}
                     onChange={(e) => setEditDescription(e.target.value)}
                     rows={4}
                     placeholder="Room for the whole paragraph, if the title isn't enough."
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", resize: "vertical", fontFamily: SANS }}
+                    className="resize-y rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] font-sans text-primary"
                   />
                 </label>
-                <div style={{ display: "flex", gap: 8 }}>
+                <div className="flex gap-2">
                   <button
                     onClick={() => saveEdit(focused.id)}
-                    style={{ border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)", borderRadius: 7, padding: "6px 13px", fontSize: 12.5, cursor: "pointer" }}
+                    className="cursor-pointer rounded-[7px] border border-primary bg-primary px-[13px] py-1.5 text-[12.5px] text-card"
                   >Save</button>
                   <button
                     onClick={() => setEditing(false)}
-                    className="sd-hover-border"
-                    style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "6px 13px", fontSize: 12.5, cursor: "pointer" }}
+                    className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[13px] py-1.5 text-[12.5px] text-secondary hover:border-primary"
                   >Cancel</button>
                 </div>
               </div>
             )}
 
             {editing && focused.kind !== "comment" && (
-              <div style={{ padding: "14px 26px 0", display: "flex", flexDirection: "column", gap: 10 }}>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+              <div className="flex flex-col gap-2.5 px-[26px] pt-3.5">
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Title
                   <input
                     value={editTitle}
                     onChange={(e) => setEditTitle(e.target.value)}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)" }}
+                    className="rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] text-primary"
                   />
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Description
                   <textarea
                     value={editDescription}
                     onChange={(e) => setEditDescription(e.target.value)}
                     rows={2}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", resize: "vertical", fontFamily: SANS }}
+                    className="resize-y rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] font-sans text-primary"
                   />
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Kind
                   <select
                     value={editKind}
                     onChange={(e) => setEditKind(e.target.value as Kind)}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", background: "var(--card-bg)" }}
+                    className="rounded-[7px] border border-default bg-card px-[9px] py-[7px] text-[13.5px] text-primary"
                   >
                     {KIND_OPTIONS.map((k) => (
                       <option key={k} value={k}>{k}</option>
                     ))}
                   </select>
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
-                  Pile
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
+                  Folder
                   <select
                     value={editCluster}
                     onChange={(e) => setEditCluster(e.target.value)}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", background: "var(--card-bg)" }}
+                    className="rounded-[7px] border border-default bg-card px-[9px] py-[7px] text-[13.5px] text-primary"
                   >
-                    {Object.entries(CLUSTERS).map(([key, v]) => (
-                      <option key={key} value={key}>{v.name}</option>
+                    {clusterList.map(({ key, name }) => (
+                      <option key={key} value={key}>{name}</option>
                     ))}
                   </select>
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Tags (comma separated)
                   <input
                     value={editTags}
                     onChange={(e) => setEditTags(e.target.value)}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)" }}
+                    className="rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] text-primary"
                   />
                 </label>
-                <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--text-muted)" }}>
+                <label className="flex flex-col gap-1 text-[12.5px] text-muted">
                   Your note
                   <textarea
                     value={editNote}
                     onChange={(e) => setEditNote(e.target.value)}
                     rows={3}
-                    style={{ border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13.5, color: "var(--text-primary)", resize: "vertical", fontFamily: SANS }}
+                    className="resize-y rounded-[7px] border border-default px-[9px] py-[7px] text-[13.5px] font-sans text-primary"
                   />
                 </label>
-                <div style={{ display: "flex", gap: 8 }}>
+                <div className="flex gap-2">
                   <button
                     onClick={() => saveEdit(focused.id)}
-                    style={{ border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)", borderRadius: 7, padding: "6px 13px", fontSize: 12.5, cursor: "pointer" }}
+                    className="cursor-pointer rounded-[7px] border border-primary bg-primary px-[13px] py-1.5 text-[12.5px] text-card"
                   >Save</button>
                   <button
                     onClick={() => setEditing(false)}
-                    className="sd-hover-border"
-                    style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "6px 13px", fontSize: 12.5, cursor: "pointer" }}
+                    className="cursor-pointer rounded-[7px] border border-strong bg-transparent px-[13px] py-1.5 text-[12.5px] text-secondary hover:border-primary"
                   >Cancel</button>
                 </div>
               </div>
             )}
 
-            <div style={{ padding: "14px 26px 26px" }}>
+            <div className="px-[26px] pb-[26px] pt-3.5">
               {discs.map((d) => {
                 const open = disc[d.key];
                 return (
-                  <div key={d.key} style={{ borderTop: "1px solid var(--border-subtle)" }}>
+                  <div key={d.key} className="border-t border-subtle">
                     <button
                       onClick={() => {
                         setDisc((prev) => ({ ...prev, [d.key]: !prev[d.key] }));
@@ -1670,77 +2531,75 @@ export default function Canvas({ initialItems, initialBucket, initialRecentOrder
                           void listItemComments(focused.id).then(setComments);
                         }
                       }}
-                      style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", border: "none", background: "none", padding: "13px 2px", cursor: "pointer" }}
+                      className="flex w-full cursor-pointer items-center gap-2.5 border-none bg-transparent px-0.5 py-[13px] text-left"
                     >
-                      <span style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: "var(--text-muted)", flex: 1 }}>{d.label}</span>
-                      <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-fainter)" }}>{d.n}</span>
-                      <span style={{ fontFamily: MONO, fontSize: 11, color: "var(--text-fainter)", width: 12, textAlign: "center" }}>{open ? "−" : "+"}</span>
+                      <span className="flex-1 font-mono text-[9.5px] uppercase tracking-[.14em] text-muted">{d.label}</span>
+                      <span className="font-mono text-[9.5px] text-fainter">{d.n}</span>
+                      <span className="w-3 text-center font-mono text-[11px] text-fainter">{open ? "−" : "+"}</span>
                     </button>
                     {open && (
-                      <div style={{ padding: "0 2px 16px" }}>
+                      <div className="px-0.5 pb-4">
                         {d.key === "highlights" && (
-                          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                          <div className="flex flex-col gap-3">
                             {focused.highlights.map((h, i) => (
-                              <div key={i} style={{ borderLeft: "2px solid var(--border-strong)", paddingLeft: 13 }}>
-                                <div style={{ fontFamily: SERIF, fontSize: 17, lineHeight: 1.42, color: "var(--text-secondary)", textWrap: "pretty" as CSSProperties["textWrap"] }}>{h.text}</div>
-                                <div style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)", marginTop: 5 }}>{h.at}</div>
+                              <div key={i} className="border-l-2 border-strong pl-[13px]">
+                                <div className="text-pretty font-serif text-[17px] leading-[1.42] text-secondary">{h.text}</div>
+                                <div className="mt-[5px] font-mono text-[9.5px] text-faint">{h.at}</div>
                               </div>
                             ))}
                             {focused.note && (
-                              <div style={{ background: "var(--accent-bg)", border: "1px solid var(--accent-border)", borderRadius: 9, padding: "12px 14px", fontSize: 13.5, color: "var(--text-secondary)", lineHeight: 1.55, textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.note}</div>
+                              <div className="text-pretty rounded-[9px] border border-accent-border bg-accent-bg px-3.5 py-3 text-[13.5px] leading-[1.55] text-secondary">{focused.note}</div>
                             )}
                           </div>
                         )}
                         {d.key === "related" && (
-                          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                          <div className="flex flex-col gap-0.5">
                             {focusedRelated.map((r) => (
                               <div
                                 key={r.id}
                                 onClick={() => { setFocusId(r.id); setDisc({ highlights: false, related: false, context: false, comments: false }); }}
-                                className="sd-hover-bg-alt"
-                                style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 8px", borderRadius: 8, cursor: "pointer" }}
+                                className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2.5 hover:bg-hover-alt"
                               >
-                                <span style={{ width: 9, height: 9, borderRadius: 2, background: r.mark, flex: "none" }} />
-                                <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</span>
-                                <span style={{ fontFamily: SERIF, fontStyle: "italic", fontSize: 13.5, color: "var(--text-muted)", flex: "none" }}>{r.why}</span>
+                                <span className="flex-none rounded size-[9px] [background:var(--sd-mark)]" style={{ ["--sd-mark" as string]: r.mark } as CSSProperties} />
+                                <span className="min-w-0 flex-1 truncate text-[13.5px] text-primary">{r.title}</span>
+                                <span className="flex-none font-serif text-[13.5px] italic text-muted">{r.why}</span>
                               </div>
                             ))}
                           </div>
                         )}
                         {d.key === "context" && (
                           <div>
-                            <div style={{ fontSize: 13.5, lineHeight: 1.6, color: "var(--text-secondary)", marginBottom: 14, textWrap: "pretty" as CSSProperties["textWrap"] }}>{focused.context}</div>
+                            <div className="text-pretty mb-3.5 text-[13.5px] leading-[1.6] text-secondary">{focused.context}</div>
                             <button
                               onClick={() => { setView(isList ? "desk" : "list"); setFocusId(null); }}
-                              className="sd-hover-border"
-                              style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}
+                              className="cursor-pointer rounded-lg border border-strong bg-transparent px-3.5 py-2 text-[13px] text-secondary hover:border-primary"
                             >{isList ? "Show it on the desk" : "Find it in the list"}</button>
                           </div>
                         )}
                         {d.key === "comments" && (
-                          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                          <div className="flex flex-col gap-3">
                             {comments.map((c) => (
                               <div key={c.id}>
-                                <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-                                  <span style={{ fontSize: 12.5, fontWeight: 500, color: "var(--text-primary)" }}>{c.userName}</span>
-                                  <span style={{ fontFamily: MONO, fontSize: 9.5, color: "var(--text-faint)" }}>{new Date(c.createdAt).toLocaleString()}</span>
+                                <div className="flex items-baseline gap-2">
+                                  <span className="text-[12.5px] font-medium text-primary">{c.userName}</span>
+                                  <span className="font-mono text-[9.5px] text-faint">{new Date(c.createdAt).toLocaleString()}</span>
                                 </div>
-                                <div style={{ fontSize: 13.5, color: "var(--text-secondary)", marginTop: 3, lineHeight: 1.5, textWrap: "pretty" as CSSProperties["textWrap"] }}>{c.body}</div>
+                                <div className="text-pretty mt-[3px] text-[13.5px] leading-[1.5] text-secondary">{c.body}</div>
                               </div>
                             ))}
-                            {comments.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No comments yet.</div>}
-                            <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                            {comments.length === 0 && <div className="text-[12.5px] text-faint">No comments yet.</div>}
+                            <div className="mt-1 flex gap-2">
                               <input
                                 value={newComment}
                                 onChange={(e) => setNewComment(e.target.value)}
                                 placeholder="Add a comment…"
                                 onKeyDown={(e) => { if (e.key === "Enter") postComment(focused.id); }}
-                                style={{ flex: 1, border: "1px solid var(--border-default)", borderRadius: 7, padding: "7px 9px", fontSize: 13, color: "var(--text-primary)", background: "var(--card-bg)" }}
+                                className="flex-1 rounded-[7px] border border-default bg-card px-[9px] py-[7px] text-[13px] text-primary"
                               />
                               <button
                                 onClick={() => postComment(focused.id)}
                                 disabled={postingComment || !newComment.trim()}
-                                style={{ border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)", borderRadius: 7, padding: "0 11px", cursor: "pointer", display: "flex", alignItems: "center", opacity: !newComment.trim() ? 0.5 : 1 }}
+                                className={`flex items-center rounded-[7px] border border-strong bg-transparent px-[11px] text-secondary ${!newComment.trim() ? "opacity-50" : "cursor-pointer"}`}
                               ><Send size={13} /></button>
                             </div>
                           </div>

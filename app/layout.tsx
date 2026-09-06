@@ -45,7 +45,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
-      className={`${instrumentSerif.variable} ${instrumentSans.variable} ${ibmPlexMono.variable}`}
+      className={`${instrumentSerif.variable} ${instrumentSans.variable} ${ibmPlexMono.variable} h-full overflow-hidden`}
       // The beforeInteractive theme script (below) sets data-theme on this
       // element before React hydrates, which will never match what the
       // server rendered (the server can't read the visitor's localStorage).
@@ -55,7 +55,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <head>
         <Script id="theme-init" strategy="beforeInteractive">{setThemeBeforePaint}</Script>
       </head>
-      <body>{children}</body>
+      <body className="bg-paper h-full overflow-hidden">{children}</body>
     </html>
   );
 }

@@ -33,22 +33,16 @@ CREATE TABLE IF NOT EXISTS items (
   seed_order INTEGER NOT NULL
 );
 
--- A project is owned either by a single user (personal) or by a
--- better-auth organization (team) — owner_type/owner_id together point at
--- one of those, never both. Projects hold stashes; stashes hold items.
-CREATE TABLE IF NOT EXISTS projects (
+-- A stash is owned either by a single user (personal) or by a better-auth
+-- organization (team) — owner_type/owner_id together point at one of
+-- those, never both. A workspace can hold several stashes; stashes hold
+-- items.
+CREATE TABLE IF NOT EXISTS stashes (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   owner_type TEXT NOT NULL,
   owner_id TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS stashes (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  name TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 
@@ -58,6 +52,19 @@ CREATE TABLE IF NOT EXISTS item_comments (
   user_id TEXT NOT NULL,
   body TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);
+
+-- Folders: the AI clusters (A/B/C/D, seeded per stash) plus any the user
+-- creates. items.cluster references clusters.id; seed items keep their
+-- original letter keys so no data rewrite is needed.
+CREATE TABLE IF NOT EXISTS clusters (
+  id TEXT NOT NULL,
+  stash_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  x REAL NOT NULL DEFAULT -1,
+  y REAL NOT NULL DEFAULT -1,
+  PRIMARY KEY (id, stash_id)
 );
 `;
 
@@ -125,12 +132,80 @@ function ensureColumn(db: DatabaseSync, column: string, def: string) {
   }
 }
 
+function ensureStashColumn(db: DatabaseSync, column: string, def: string) {
+  const cols = db.prepare("PRAGMA table_info(stashes)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE stashes ADD COLUMN ${column} ${def}`);
+  }
+}
+
+// Folders (clusters) keep their own desk position now that they're draggable
+// desk objects, not labels riding their cards. -1 = "never moved yet", so
+// the client falls back to a deterministic default spot.
+function ensureClusterColumn(db: DatabaseSync, column: string, def: string) {
+  const cols = db.prepare("PRAGMA table_info(clusters)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE clusters ADD COLUMN ${column} ${def}`);
+  }
+}
+
+// The pre-merger schema kept a `projects` table and pointed each stash at
+// it via project_id; workspaces could have several stashes but only one
+// project. This merges them — the stash itself now carries the owner and
+// description that used to live on the project, and the projects table is
+// dropped. No-op on a fresh database (SCHEMA already created the new-shape
+// stashes table).
+function mergeProjectsIntoStashes(db: DatabaseSync) {
+  const cols = db.prepare("PRAGMA table_info(stashes)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "owner_type")) {
+    db.exec(`
+      ALTER TABLE stashes ADD COLUMN description TEXT NOT NULL DEFAULT '';
+      ALTER TABLE stashes ADD COLUMN owner_type TEXT NOT NULL DEFAULT 'user';
+      ALTER TABLE stashes ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+      UPDATE stashes SET
+        owner_type = (SELECT p.owner_type FROM projects p WHERE p.id = stashes.project_id),
+        owner_id = (SELECT p.owner_id FROM projects p WHERE p.id = stashes.project_id),
+        description = (SELECT p.description FROM projects p WHERE p.id = stashes.project_id);
+      DROP TABLE projects;
+    `);
+  }
+}
+
+// Pre-fix databases have clusters.id as a lone (global) primary key, so the
+// default folder ids "A"/"B"/"C"/"D" collide across every stash — whichever
+// stash seeds them first wins, and INSERT OR IGNORE silently drops the
+// default folders for every other stash, leaving their items' cluster field
+// pointing at nothing. Rebuild with a composite (id, stash_id) key so each
+// stash gets its own row.
+function fixClustersPrimaryKey(db: DatabaseSync) {
+  const cols = db.prepare("PRAGMA table_info(clusters)").all() as { name: string; pk: number }[];
+  const soleIdKey = cols.filter((c) => c.pk > 0).length === 1 && cols.some((c) => c.pk === 1 && c.name === "id");
+  if (!soleIdKey) return;
+  db.exec(`
+    CREATE TABLE clusters_new (
+      id TEXT NOT NULL,
+      stash_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (id, stash_id)
+    );
+    INSERT INTO clusters_new SELECT id, stash_id, name, created_at FROM clusters;
+    DROP TABLE clusters;
+    ALTER TABLE clusters_new RENAME TO clusters;
+  `);
+}
+
 export function getDb(): DatabaseSync {
   if (!globalThis.__stashdropDb) {
     const db = new DatabaseSync(path.join(process.cwd(), "stashdrop.db"));
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec(SCHEMA);
     MIGRATIONS.forEach(([column, def]) => ensureColumn(db, column, def));
+    mergeProjectsIntoStashes(db);
+    fixClustersPrimaryKey(db);
+    ensureStashColumn(db, "starter_seeded", "INTEGER");
+    ensureClusterColumn(db, "x", "REAL NOT NULL DEFAULT -1");
+    ensureClusterColumn(db, "y", "REAL NOT NULL DEFAULT -1");
     globalThis.__stashdropDb = db;
   }
   return globalThis.__stashdropDb;
@@ -140,7 +215,7 @@ export const DEMO_EMAIL = "ashwincherian.spam+demo@gmail.com";
 export const DEMO_PASSWORD = "demo1234";
 
 // Seeds a real, signed-in-able demo account (personal workspace, one
-// project/stash, the same sample bookmarks the app used to seed as
+// stash, the same sample bookmarks the app used to seed as
 // unowned rows) — runs once, after better-auth's own tables exist (see
 // the call site in auth.ts), guarded by the demo user already existing so
 // it never re-seeds or duplicates on later boots.
@@ -165,8 +240,7 @@ export async function seedDemoWorkspace() {
     db.prepare("INSERT INTO account (id, issuer, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, 'credential', ?, ?, ?, ?)")
       .run(randomUUID(), "local:credential", userId, userId, hashedPassword, now, now);
 
-    const project = createProject("Demo stash", "", "user", userId);
-    const stash = createStash(project.id, "Demo stash");
+    const stash = createStash("Demo stash", "", "user", userId);
 
     // Prefixed so these ids can never collide with a real captured item's
     // id (or, on an install that upgraded from the old unowned-seed-rows
@@ -366,55 +440,168 @@ export function insertItem(item: StashItem, bucket: string, createdAt: number, s
   } satisfies Record<string, unknown>);
 }
 
-export const clusterList = Object.entries(CLUSTERS).map(([key, v]) => ({ key, name: v.name }));
+// The default folders every stash gets (also the keys seed items carry).
+// Seeded on first read so pre-existing stashes upgrade in place; a stash
+// that has any clusters at all is left alone.
+const DEFAULT_CLUSTERS = ["A", "B", "C", "D"];
 
-export interface Project { id: string; name: string; description: string; ownerType: string; ownerId: string; createdAt: number }
-export interface Stash { id: string; projectId: string; name: string; createdAt: number }
-
-interface ProjectRow { id: string; name: string; description: string; owner_type: string; owner_id: string; created_at: number }
-interface StashRow { id: string; project_id: string; name: string; created_at: number }
-
-function rowToProject(r: ProjectRow): Project {
-  return { id: r.id, name: r.name, description: r.description, ownerType: r.owner_type, ownerId: r.owner_id, createdAt: r.created_at };
+function ensureDefaultClusters(db: DatabaseSync, stashId: string) {
+  const has = db.prepare("SELECT 1 FROM clusters WHERE stash_id = ? LIMIT 1").get(stashId);
+  if (has) return;
+  const now = Date.now();
+  const insert = db.prepare("INSERT OR IGNORE INTO clusters (id, stash_id, name, created_at) VALUES (?, ?, ?, ?)");
+  DEFAULT_CLUSTERS.forEach((key, i) => insert.run(key, stashId, CLUSTERS[key]?.name || key, now + i));
 }
+
+export function getClusters(stashId: string): { key: string; name: string; x: number; y: number }[] {
+  const db = getDb();
+  ensureDefaultClusters(db, stashId);
+  const rows = db.prepare("SELECT id, name, x, y FROM clusters WHERE stash_id = ? ORDER BY created_at ASC").all(stashId) as { id: string; name: string; x: number; y: number }[];
+  return rows.map((r) => ({ key: r.id, name: r.name, x: r.x, y: r.y }));
+}
+
+export function saveClusterPosition(stashId: string, key: string, x: number, y: number) {
+  getDb().prepare("UPDATE clusters SET x = ?, y = ? WHERE id = ? AND stash_id = ?").run(x, y, key, stashId);
+}
+
+export function getClusterNames(stashId: string): Record<string, string> {
+  return Object.fromEntries(getClusters(stashId).map((c) => [c.key, c.name]));
+}
+
+export function createCluster(stashId: string, name: string): { key: string; name: string } {
+  const key = "u" + randomUUID().slice(0, 8);
+  getDb().prepare("INSERT INTO clusters (id, stash_id, name, created_at) VALUES (?, ?, ?, ?)").run(key, stashId, name, Date.now());
+  return { key, name };
+}
+
+export function renameCluster(stashId: string, key: string, name: string) {
+  getDb().prepare("UPDATE clusters SET name = ? WHERE id = ? AND stash_id = ?").run(name, key, stashId);
+}
+
+export function deleteCluster(stashId: string, key: string) {
+  getDb().prepare("DELETE FROM clusters WHERE id = ? AND stash_id = ?").run(key, stashId);
+}
+
+// Removing a folder's contents back to the desk (cluster → "") or to the
+// trash. Both run before the folder row is deleted.
+export function unclusterItems(stashId: string, key: string) {
+  getDb().prepare("UPDATE items SET cluster = '' WHERE stash_id = ? AND cluster = ?").run(stashId, key);
+}
+
+export function trashItemsInCluster(stashId: string, key: string) {
+  getDb().prepare("UPDATE items SET deleted_at = ? WHERE stash_id = ? AND cluster = ?").run(Date.now(), stashId, key);
+}
+
+// The text the "ask anything" card feeds the local model — the selected
+// items if any were chosen, otherwise the whole stash (capped).
+export function getStashTextForAsk(stashId: string, ids?: string[]): string {
+  const rows = getDb().prepare(
+    "SELECT id, title, description, tags, note, body FROM items WHERE stash_id = ? AND deleted_at IS NULL"
+  ).all(stashId) as { id: string; title: string; description: string; tags: string; note: string; body: string | null }[];
+  const picked = ids && ids.length ? rows.filter((r) => ids.includes(r.id)) : rows;
+  return picked.slice(0, 20).map((r) => {
+    const parts = [r.title];
+    if (r.description) parts.push(r.description.slice(0, 200));
+    const tags = JSON.parse(r.tags) as string[];
+    if (tags.length) parts.push("tags: " + tags.join(", "));
+    if (r.note) parts.push("note: " + r.note.slice(0, 200));
+    if (r.body) parts.push(r.body.slice(0, 200));
+    return "- " + parts.join(" | ");
+  }).join("\n");
+}
+
+export interface Stash { id: string; name: string; description: string; ownerType: "user" | "organization"; ownerId: string; createdAt: number }
+
+interface StashRow { id: string; name: string; description: string; owner_type: string; owner_id: string; created_at: number }
+
 function rowToStash(r: StashRow): Stash {
-  return { id: r.id, projectId: r.project_id, name: r.name, createdAt: r.created_at };
+  return { id: r.id, name: r.name, description: r.description, ownerType: r.owner_type as "user" | "organization", ownerId: r.owner_id, createdAt: r.created_at };
 }
 
-export function createProject(name: string, description: string, ownerType: "user" | "organization", ownerId: string): Project {
+export function createStash(name: string, description: string, ownerType: "user" | "organization", ownerId: string): Stash {
   const id = randomUUID();
   const createdAt = Date.now();
-  getDb().prepare("INSERT INTO projects (id, name, description, owner_type, owner_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+  getDb().prepare("INSERT INTO stashes (id, name, description, owner_type, owner_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .run(id, name, description, ownerType, ownerId, createdAt);
   return { id, name, description, ownerType, ownerId, createdAt };
-}
-
-export function getProject(id: string): Project | null {
-  const row = getDb().prepare("SELECT * FROM projects WHERE id = ?").get(id) as unknown as ProjectRow | undefined;
-  return row ? rowToProject(row) : null;
-}
-
-export function updateProject(id: string, edits: { name?: string; description?: string }): Project | null {
-  const db = getDb();
-  const current = db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as unknown as ProjectRow | undefined;
-  if (!current) return null;
-  const name = edits.name ?? current.name;
-  const description = edits.description ?? current.description;
-  db.prepare("UPDATE projects SET name = ?, description = ? WHERE id = ?").run(name, description, id);
-  return rowToProject({ ...current, name, description });
-}
-
-export function createStash(projectId: string, name: string): Stash {
-  const db = getDb();
-  const id = randomUUID();
-  const createdAt = Date.now();
-  db.prepare("INSERT INTO stashes (id, project_id, name, created_at) VALUES (?, ?, ?, ?)").run(id, projectId, name, createdAt);
-  return { id, projectId, name, createdAt };
 }
 
 export function getStash(id: string): Stash | null {
   const row = getDb().prepare("SELECT * FROM stashes WHERE id = ?").get(id) as unknown as StashRow | undefined;
   return row ? rowToStash(row) : null;
+}
+
+export function updateStash(id: string, edits: { name?: string; description?: string }): Stash | null {
+  const db = getDb();
+  const current = db.prepare("SELECT * FROM stashes WHERE id = ?").get(id) as unknown as StashRow | undefined;
+  if (!current) return null;
+  const name = edits.name ?? current.name;
+  const description = edits.description ?? current.description;
+  db.prepare("UPDATE stashes SET name = ?, description = ? WHERE id = ?").run(name, description, id);
+  return rowToStash({ ...current, name, description });
+}
+
+export function listStashesForOwner(ownerType: "user" | "organization", ownerId: string): Stash[] {
+  const rows = getDb().prepare("SELECT * FROM stashes WHERE owner_type = ? AND owner_id = ? ORDER BY created_at ASC").all(ownerType, ownerId) as unknown as StashRow[];
+  return rows.map(rowToStash);
+}
+
+// Two welcome cards dropped on a brand-new user's very first stash, so the
+// empty desk explains itself. Plain note items — read them, drag them, or
+// delete them like anything else. Ids are globally unique and only ever
+// seeded once (guarded by the caller's "first stash" check), so they can't
+// collide. Marks the stash as seeded so the boot-time backfill never
+// re-seeds into an intentionally-emptied first stash.
+export function seedStarterCards(stashId: string, createdBy: string) {
+  const now = Date.now();
+  const cards: StashItem[] = [
+    {
+      id: "welcome-1", kind: "note", cluster: "", x: 420, y: 200, w: 200,
+      title: "Welcome to Stashdrop", domain: "stashdrop", kept: "just now",
+      isText: true, body: "Everything you keep lands on this desk. Drag cards to arrange them, drop things into folders, and scroll to zoom out over it all.",
+      description: "", tags: [], highlights: [], note: "", related: [], context: "",
+      url: undefined, image: undefined,
+    },
+    {
+      id: "welcome-2", kind: "note", cluster: "", x: 420, y: 430, w: 200,
+      title: "Things to try", domain: "stashdrop", kept: "just now",
+      isText: true, body: "Paste a link in the search bar to keep it. Drop an image or PDF straight onto the desk. Ask anything with the sparkle tool. Shift-drag to select a group, then ask about it. Press ⌘K to search.",
+      description: "", tags: [], highlights: [], note: "", related: [], context: "",
+      url: undefined, image: undefined,
+    },
+  ];
+  cards.forEach((item, i) => insertItem(item, "This week", now + i, stashId, createdBy));
+  getDb().prepare("UPDATE stashes SET starter_seeded = 1 WHERE id = ?").run(stashId);
+}
+
+// Heals stashes that missed the welcome cards — the onboarding bug where
+// the "first stash" check ran after createStash, or pre-feature first
+// stashes. Targets only a stash that is its owner's earliest AND empty AND
+// not yet flagged; once seeded it's flagged, so an intentionally-emptied
+// first stash never gets them again.
+export function backfillStarterCards() {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT s.id
+    FROM stashes s
+    WHERE s.starter_seeded IS NULL
+      AND NOT EXISTS (SELECT 1 FROM items i WHERE i.stash_id = s.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM stashes s2
+        WHERE s2.owner_type = s.owner_type AND s2.owner_id = s.owner_id
+          AND s2.created_at < s.created_at
+      )
+  `).all() as { id: string }[];
+  for (const row of rows) {
+    seedStarterCards(row.id, "system");
+  }
+}
+
+// Relocates an item into a different stash — the item keeps its own
+// position/cluster, so it lands in the target stash's desk wherever those
+// coordinates happen to fall (same as a plain drag once it's there).
+export function moveItemToStash(id: string, stashId: string): void {
+  getDb().prepare("UPDATE items SET stash_id = ? WHERE id = ?").run(stashId, id);
 }
 
 // The "current stash" for a signed-in user, resolved fresh from the DB
@@ -428,28 +615,28 @@ export function getStash(id: string): Stash | null {
 // long-lived session and membership can be revoked afterward (removed from
 // a team) — every caller of this function is, in effect, re-running that
 // check on every request, which is what actually keeps a removed member
-// from still reading (or writing to) a team's stash. Falls back to the
-// personal workspace exactly as if no org had ever been made active. Picks
-// the earliest-created stash if a workspace somehow has more than one — no
-// multi-project-per-workspace UI exists yet, so "first" is "the" project.
-export function getStashForWorkspace(userId: string, activeOrganizationId: string | null): Stash | null {
+// from still reading (or writing to) a team's stash. A workspace can hold
+// several stashes — preferredStashId (the caller's last-picked one, read
+// from a cookie) wins as long as it actually belongs to that workspace;
+// otherwise this falls back to the earliest-created one, same as before
+// that selection existed.
+export function getStashForWorkspace(userId: string, activeOrganizationId: string | null, preferredStashId?: string | null): Stash | null {
   const db = getDb();
   const orgId = resolveActiveOrg(userId, activeOrganizationId);
-  const project = orgId
-    ? db.prepare(
-        "SELECT * FROM projects WHERE owner_type = 'organization' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
-      ).get(orgId) as unknown as ProjectRow | undefined
-    : db.prepare(
-        "SELECT * FROM projects WHERE owner_type = 'user' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
-      ).get(userId) as unknown as ProjectRow | undefined;
-  if (!project) return null;
+  const ownerType = orgId ? "organization" : "user";
+  const ownerId = orgId ?? userId;
 
-  const row = db.prepare("SELECT * FROM stashes WHERE project_id = ? ORDER BY created_at ASC LIMIT 1").get(project.id) as unknown as StashRow | undefined;
+  if (preferredStashId) {
+    const preferred = db.prepare("SELECT * FROM stashes WHERE id = ? AND owner_type = ? AND owner_id = ?").get(preferredStashId, ownerType, ownerId) as unknown as StashRow | undefined;
+    if (preferred) return rowToStash(preferred);
+  }
+
+  const row = db.prepare("SELECT * FROM stashes WHERE owner_type = ? AND owner_id = ? ORDER BY created_at ASC LIMIT 1").get(ownerType, ownerId) as unknown as StashRow | undefined;
   return row ? rowToStash(row) : null;
 }
 
 // A workspace's owner/admin/member role for permission checks (deleting
-// someone else's bookmark, deleting the project, managing members) —
+// someone else's bookmark, deleting the stash, managing members) —
 // queried straight from better-auth's own `member` table, same pattern the
 // org join above used to use. Null for a personal workspace (no `member`
 // row exists there — the caller is always its sole, full owner).
@@ -474,28 +661,23 @@ export function resolveActiveOrg(userId: string, activeOrganizationId: string | 
 }
 
 // True when the user already has at least one workspace anywhere (a personal
-// project, or membership in an org that has a project). Tells a brand-new
+// stash, or membership in an org that has a stash). Tells a brand-new
 // sign-up — who still needs the full "Personal or team" onboarding choice —
 // apart from an existing user switching into a workspace that has no stash
 // yet, where the workspace is already decided and only the stash name is
 // needed.
 export function hasAnyWorkspace(userId: string): boolean {
   const db = getDb();
-  if (db.prepare("SELECT 1 FROM projects WHERE owner_type = 'user' AND owner_id = ? LIMIT 1").get(userId)) return true;
+  if (db.prepare("SELECT 1 FROM stashes WHERE owner_type = 'user' AND owner_id = ? LIMIT 1").get(userId)) return true;
   return !!db.prepare(
-    "SELECT 1 FROM projects p JOIN member m ON m.organizationId = p.owner_id WHERE p.owner_type = 'organization' AND m.userId = ? LIMIT 1"
+    "SELECT 1 FROM stashes s JOIN member m ON m.organizationId = s.owner_id WHERE s.owner_type = 'organization' AND m.userId = ? LIMIT 1"
   ).get(userId);
 }
 
-export function getFirstProjectForOrg(organizationId: string): Project | null {
+export function getFirstStashForOrg(organizationId: string): Stash | null {
   const row = getDb().prepare(
-    "SELECT * FROM projects WHERE owner_type = 'organization' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
-  ).get(organizationId) as unknown as ProjectRow | undefined;
-  return row ? rowToProject(row) : null;
-}
-
-export function getFirstStashForProject(projectId: string): Stash | null {
-  const row = getDb().prepare("SELECT * FROM stashes WHERE project_id = ? ORDER BY created_at ASC LIMIT 1").get(projectId) as unknown as StashRow | undefined;
+    "SELECT * FROM stashes WHERE owner_type = 'organization' AND owner_id = ? ORDER BY created_at ASC LIMIT 1"
+  ).get(organizationId) as unknown as StashRow | undefined;
   return row ? rowToStash(row) : null;
 }
 
@@ -504,19 +686,15 @@ export function getItemOwner(id: string): { createdBy: string | null; stashId: s
   return row ? { createdBy: row.created_by, stashId: row.stash_id } : null;
 }
 
-// Deletes a project, its stashes, and everything in them — used when an
-// owner deletes a project. The app has no notion of a zero-project
-// workspace, so callers immediately create a fresh replacement project
-// afterward (see deleteProject in workspace-actions.ts).
-export function deleteProjectCascade(projectId: string) {
+// Deletes one stash and everything in it — used when an owner deletes the
+// current stash from settings. If it was the workspace's last stash, the
+// next page load resolves no active stash and onboarding invites the user
+// to make a fresh one.
+export function deleteStash(stashId: string) {
   const db = getDb();
-  const stashIds = (db.prepare("SELECT id FROM stashes WHERE project_id = ?").all(projectId) as { id: string }[]).map((r) => r.id);
-  for (const stashId of stashIds) {
-    db.prepare("DELETE FROM item_comments WHERE item_id IN (SELECT id FROM items WHERE stash_id = ?)").run(stashId);
-    db.prepare("DELETE FROM items WHERE stash_id = ?").run(stashId);
-  }
-  db.prepare("DELETE FROM stashes WHERE project_id = ?").run(projectId);
-  db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+  db.prepare("DELETE FROM item_comments WHERE item_id IN (SELECT id FROM items WHERE stash_id = ?)").run(stashId);
+  db.prepare("DELETE FROM items WHERE stash_id = ?").run(stashId);
+  db.prepare("DELETE FROM stashes WHERE id = ?").run(stashId);
 }
 
 export interface ItemComment { id: string; itemId: string; userId: string; userName: string; body: string; createdAt: number }

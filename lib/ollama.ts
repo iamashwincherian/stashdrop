@@ -16,7 +16,7 @@ export async function enrichWithOllama(input: {
   textSample: string;
   clusters: { key: string; name: string }[];
 }): Promise<Enrichment | null> {
-  const prompt = `You are filing a saved link into one of these existing piles:
+  const prompt = `You are filing a saved link into one of these existing folders:
 ${input.clusters.map((c) => `${c.key}: ${c.name}`).join("\n")}
 
 Saved page:
@@ -26,7 +26,7 @@ Existing description: ${input.description || "(none)"}
 Content sample: ${input.textSample.slice(0, 1500) || "(none)"}
 
 Respond with ONLY JSON in this exact shape:
-{"description": "one or two sentence summary, in the voice of someone noting why they saved it", "tags": ["3-4 short lowercase tags"], "cluster": "the single best-fit pile letter from the list above", "context": "one sentence on why it belongs in that pile", "highlights": [{"text": "a notable sentence or claim from the content sample, close to verbatim", "at": "a short location hint like 'early in the piece' or 'near the end'"}]}
+{"description": "one or two sentence summary, in the voice of someone noting why they saved it", "tags": ["3-4 short lowercase tags"], "cluster": "the single best-fit folder letter from the list above", "context": "one sentence on why it belongs in that folder", "highlights": [{"text": "a notable sentence or claim from the content sample, close to verbatim", "at": "a short location hint like 'early in the piece' or 'near the end'"}]}
 Include 0-2 highlights — only if the content sample actually has a genuinely quotable line; don't invent one.`;
 
   try {
@@ -59,6 +59,32 @@ Include 0-2 highlights — only if the content sample actually has a genuinely q
       context: String(parsed.context || "").slice(0, 500),
       highlights,
     };
+  } catch {
+    return null;
+  }
+}
+
+// The "ask anything" card: a plain conversation answer, grounded in the
+// items currently on the desk (the selected ones, or the whole stash).
+export async function askWithOllama(question: string, context: string): Promise<string | null> {
+  const prompt = `You are the assistant living on someone's bookmark desk. Answer the question directly and usefully, in plain prose, no markdown.\n\n${
+    context ? "Things currently on the desk:\n" + context.slice(0, 6000) + "\n\n" : ""
+  }Question: ${question}`;
+
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: "POST",
+      signal: AbortSignal.timeout(45_000),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        stream: false,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return typeof data.message?.content === "string" ? data.message.content.trim().slice(0, 4000) : null;
   } catch {
     return null;
   }

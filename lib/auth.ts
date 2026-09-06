@@ -6,12 +6,19 @@ import { getDb, seedDemoWorkspace } from "./db";
 import { sendMail } from "./mailer";
 
 // Shares the same SQLite file/connection as the app's own data (items,
-// projects, stashes) — one database, not two.
+// stashes) — one database, not two.
 export const auth = betterAuth({
   database: getDb(),
   emailAndPassword: {
     enabled: true,
     requireEmailVerification: true,
+    async sendResetPassword({ user, url }) {
+      await sendMail({
+        to: user.email,
+        subject: "Reset your Stashdrop password",
+        html: `<p>Someone requested a password reset for your Stashdrop account.</p><p><a href="${url}">Reset your password</a></p><p>If you didn't request this, you can ignore this email. The link expires in an hour.</p>`,
+      });
+    },
   },
   emailVerification: {
     // Re-sends a fresh code on a blocked sign-in attempt instead of just

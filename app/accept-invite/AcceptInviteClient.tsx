@@ -5,9 +5,6 @@ import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
 import { acceptInvite, declineInvite } from "@/lib/workspace-client";
 
-const SERIF = "var(--font-serif), serif";
-const SANS = "var(--font-sans), system-ui, sans-serif";
-
 export default function AcceptInviteClient({ invitationId }: { invitationId: string }) {
   const router = useRouter();
   const [invite, setInvite] = useState<{ organizationId: string; organizationName: string } | null | undefined>(undefined);
@@ -48,45 +45,36 @@ export default function AcceptInviteClient({ invitationId }: { invitationId: str
   }
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "var(--paper)", display: "grid", placeItems: "center", padding: 20 }}>
-      <div style={{
-        width: "min(400px, 100%)", background: "var(--surface-solid)", border: "1px solid var(--border-default)", borderRadius: 14,
-        padding: "28px 26px", boxShadow: "0 24px 60px rgba(var(--shadow-color),.1)", fontFamily: SANS,
-      }}>
-        {invite === undefined && <div style={{ fontSize: 13, color: "var(--text-faint)" }}>Loading…</div>}
+    <div className="fixed inset-0 grid place-items-center bg-paper p-5">
+      <div className="w-[min(400px,100%)] rounded-[14px] border border-default bg-surface-solid px-[26px] py-7 font-sans shadow-[0_24px_60px_rgba(var(--shadow-color),.1)]">
+        {invite === undefined && <div className="text-[13px] text-faint">Loading…</div>}
         {invite === null && (
           <>
-            <div style={{ fontFamily: SERIF, fontSize: 22, color: "var(--text-primary)", marginBottom: 8 }}>Invite not found</div>
-            <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
+            <div className="mb-2 font-serif text-[22px] text-primary">Invite not found</div>
+            <div className="text-[13px] text-muted">
               This invitation may have expired, already been used, or was sent to a different email address.
             </div>
           </>
         )}
         {invite && (
           <>
-            <div style={{ fontFamily: SERIF, fontSize: 22, color: "var(--text-primary)", marginBottom: 8 }}>
+            <div className="mb-2 font-serif text-[22px] text-primary">
               Join {invite.organizationName}?
             </div>
-            <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 20 }}>
+            <div className="mb-5 text-[13px] text-muted">
               You&apos;ve been invited to this team&apos;s workspace on Stashdrop.
             </div>
-            {error && <div style={{ fontSize: 12.5, color: "var(--danger)", marginBottom: 12 }}>{error}</div>}
-            <div style={{ display: "flex", gap: 10 }}>
+            {error && <div className="mb-3 text-[12.5px] text-danger">{error}</div>}
+            <div className="flex gap-2.5">
               <button
                 onClick={accept}
                 disabled={busy}
-                style={{
-                  border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)",
-                  borderRadius: 8, padding: "9px 16px", fontSize: 13.5, fontWeight: 500, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1,
-                }}
+                className={`rounded-lg border border-primary bg-primary px-4 py-[9px] text-[13.5px] font-medium text-card ${busy ? "cursor-default opacity-60" : "cursor-pointer"}`}
               >{busy ? "Please wait…" : "Accept"}</button>
               <button
                 onClick={decline}
                 disabled={busy}
-                style={{
-                  border: "1px solid var(--border-strong)", background: "none", color: "var(--text-secondary)",
-                  borderRadius: 8, padding: "9px 16px", fontSize: 13.5, cursor: busy ? "default" : "pointer",
-                }}
+                className={`rounded-lg border border-strong bg-transparent px-4 py-[9px] text-[13.5px] text-secondary ${busy ? "cursor-default" : "cursor-pointer"}`}
               >Decline</button>
             </div>
           </>

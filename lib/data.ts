@@ -1,4 +1,4 @@
-export type Kind = "article" | "video" | "image" | "pdf" | "note" | "quote" | "repo" | "shot" | "comment";
+export type Kind = "article" | "video" | "image" | "pdf" | "note" | "quote" | "repo" | "shot" | "comment" | "ask";
 
 export interface StashItem {
   id: string;
@@ -44,15 +44,17 @@ export const MARK: Record<string, string> = {
   repo: "#4C5A4A",
   shot: "#8A7A5A",
   comment: "#B5860B",
+  ask: "#5B6C8A",
 };
 
 export const TINT: Record<string, string> = {
-  article: "var(--tint-article)",
-  video: "var(--tint-video)",
-  image: "var(--tint-image)",
-  pdf: "var(--tint-pdf)",
-  repo: "var(--tint-repo)",
-  shot: "var(--tint-shot)",
+  article: "bg-tint-article",
+  video: "bg-tint-video",
+  image: "bg-tint-image",
+  pdf: "bg-tint-pdf",
+  repo: "bg-tint-repo",
+  shot: "bg-tint-shot",
+  ask: "bg-tint-article",
 };
 
 export function bars(kind: string, seed: number): Bar[] {
@@ -93,7 +95,7 @@ export const OBJ: StashItem[] = [
     tags: ["local-first", "sync", "architecture"],
     highlights: [{ text: "The network is an optimization, not a requirement.", at: "§ 3, Ideal 4" }, { text: "Cloud apps rent you your own data back.", at: "§ 1" }],
     note: "This is the piece I keep sending people. Ideal 4 is the one that actually changes how you build.",
-    related: ["l2", "l3", "u1"], context: "The anchor of the local-first pile. Two of the four things next to it were saved within an hour of reading it, and the automerge repo came from its references.",
+    related: ["l2", "l3", "u1"], context: "The anchor of the local-first folder. Two of the four things next to it were saved within an hour of reading it, and the automerge repo came from its references.",
   },
   {
     id: "l2", kind: "article", cluster: "A", x: 478, y: 186, w: 190, title: "CRDTs are hard, but not that hard", domain: "jlongster.com", kept: "14 Jan",
@@ -106,7 +108,7 @@ export const OBJ: StashItem[] = [
     id: "l3", kind: "repo", cluster: "A", x: 262, y: 432, w: 186, title: "automerge/automerge", domain: "github.com", kept: "14 Jan",
     description: "The CRDT library both of the local-first pieces point at. Rust core, JS bindings, a document model that survives being edited offline on two machines.",
     tags: ["CRDT", "library", "rust"], highlights: [], note: "Worth reading the docs on save format before committing to it.",
-    related: ["l1", "l2"], context: "Arrived from the references of the Ink & Switch essay. It is the only thing in this pile that is code rather than argument.",
+    related: ["l1", "l2"], context: "Arrived from the references of the Ink & Switch essay. It is the only thing in this folder that is code rather than argument.",
   },
   {
     id: "l4", kind: "note", cluster: "A", x: 492, y: 404, w: 200, isText: true, body: "Sync is a product decision, not a backend one. Pick the merge behaviour you can explain to a user, then find the algorithm.", domain: "note", kept: "16 Jan",
@@ -124,13 +126,13 @@ export const OBJ: StashItem[] = [
     tags: ["video", "creator", "retention"],
     highlights: [{ text: "The first 1.2 seconds decide retention.", at: "02:40" }, { text: "Produced spots read as advertising and get skipped.", at: "04:12" }],
     note: "The 1.2 second claim matches our own Q3 numbers almost exactly.",
-    related: ["c3", "c2", "c4"], context: "The centre of the video pile. The Q3 review was pulled up to sit next to it because the two agree, and the reference grid followed a day later.",
+    related: ["c3", "c2", "c4"], context: "The centre of the video folder. The Q3 review was pulled up to sit next to it because the two agree, and the reference grid followed a day later.",
   },
   {
     id: "c2", kind: "image", cluster: "B", x: 1396, y: 396, w: 186, title: "Reference grid — product in hand", domain: "uploaded · 2400×3000", kept: "23 Aug",
     description: "Nine frames, one hard light source, product held rather than staged. No flatlays anywhere in the set.",
     tags: ["reference", "photography"], highlights: [], note: "Every frame that works has a hand in it. That rules out the flatlay direction.",
-    related: ["c1", "t1"], context: "Sits between the video pile and the print pile — it belongs to both, which is why it is on the edge rather than inside either.",
+    related: ["c1", "t1"], context: "Sits between the video folder and the print folder — it belongs to both, which is why it is on the edge rather than inside either.",
   },
   {
     id: "c3", kind: "pdf", cluster: "B", x: 1150, y: 426, w: 194, title: "Q3 social performance review", domain: "internal · 24pp", kept: "19 Aug",
@@ -148,7 +150,7 @@ export const OBJ: StashItem[] = [
     id: "t1", kind: "image", cluster: "C", x: 300, y: 790, w: 200, title: "Swiss print spreads, 1968–74", domain: "uploaded · 14 scans", kept: "3 Feb",
     description: "Scans from a run of Swiss magazine spreads. Tight measure, generous leading, almost no rules or boxes.",
     tags: ["typography", "print", "reference"], highlights: [], note: "The spacing, not the grid, is what makes these calm.",
-    related: ["t2", "c2"], context: "Started the print pile. Everything else here was saved because of it.",
+    related: ["t2", "c2"], context: "Started the print folder. Everything else here was saved because of it.",
   },
   {
     id: "t2", kind: "article", cluster: "C", x: 536, y: 824, w: 190, title: "Optical sizes, explained properly", domain: "typographica.org", kept: "5 Feb",
@@ -166,7 +168,7 @@ export const OBJ: StashItem[] = [
     id: "u1", kind: "article", cluster: "D", x: 1160, y: 790, w: 196, title: "Making software feel physical", domain: "frankchimero.com", kept: "2 days ago",
     description: "On interfaces that behave like objects rather than documents — weight, inertia, and the difference between moving something and submitting a form.",
     tags: ["interaction", "craft"], highlights: [{ text: "Direct manipulation is a promise: what you touch is the thing itself.", at: "§ 4" }], note: "",
-    related: ["u2", "l1"], context: "Not filed yet. It keeps drifting towards the local-first pile, which is probably where it belongs.",
+    related: ["u2", "l1"], context: "Not filed yet. It keeps drifting towards the local-first folder, which is probably where it belongs.",
   },
   {
     id: "u2", kind: "video", cluster: "D", x: 1400, y: 836, w: 194, title: "Hand-drawn interfaces", domain: "youtube.com · 41:08", kept: "yesterday", playhead: true,
@@ -196,11 +198,11 @@ export const BUCKET: Record<string, string> = {
 export const WHY: Record<string, string> = {
   l1: "named the pattern", l2: "argues with the essay", l3: "came from its references", l4: "written while reading the CRDT post", l5: "clipped from the essay",
   c1: "the teardown itself", c2: "saved a day after the teardown", c3: "our numbers, same finding", c4: "the craft notes",
-  t1: "started this pile", t2: "why the spreads work", t3: "kept for the small sizes", u1: "drifting towards local-first", u2: "shares a topic with the essay", u3: "clipped from the talk",
+  t1: "started this folder", t2: "why the spreads work", t3: "kept for the small sizes", u1: "drifting towards local-first", u2: "shares a topic with the essay", u3: "clipped from the talk",
 };
 
 export const WHY_RELATED: Record<string, string> = {
   l1: "named the pattern", l2: "argues with it", l3: "from its references", l4: "written while reading", l5: "clipped from it",
   c1: "the teardown", c2: "saved a day later", c3: "same finding, our data", c4: "the craft notes",
-  t1: "started this pile", t2: "why it works", t3: "the small sizes", u1: "shares a topic", u2: "the talk", u3: "clipped from it",
+  t1: "started this folder", t2: "why it works", t3: "the small sizes", u1: "shares a topic", u2: "the talk", u3: "clipped from it",
 };

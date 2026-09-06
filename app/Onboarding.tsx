@@ -4,17 +4,10 @@ import { useEffect, useState } from "react";
 import { Building2, User, Check, Mail } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import { completeOnboarding } from "@/lib/workspace-actions";
-import { createTeamAndProject, acceptInvite } from "@/lib/workspace-client";
+import { createTeamAndStash, acceptInvite } from "@/lib/workspace-client";
 
-const SERIF = "var(--font-serif), serif";
-const SANS = "var(--font-sans), system-ui, sans-serif";
-const MONO = "var(--font-mono), monospace";
-
-const inputStyle: React.CSSProperties = {
-  width: "100%", border: "1px solid var(--border-default)", background: "var(--card-bg)",
-  borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "var(--text-primary)",
-  fontFamily: SANS, outline: "none",
-};
+const inputClass =
+  "w-full rounded-lg border border-default bg-card px-3 py-2.5 text-sm text-primary font-sans outline-none";
 
 interface PendingInvite { id: string; organizationId: string; organizationName: string }
 
@@ -67,12 +60,12 @@ export default function Onboarding({ onComplete, initialScope, organizationId }:
         if (organizationId) {
           // Switching into an existing team — reuse it instead of creating
           // another one.
-          await completeOnboarding({ scope: "organization", organizationId, projectName: stashName.trim() || "First stash", projectDescription: "", stashName });
+          await completeOnboarding({ scope: "organization", organizationId, stashName: stashName.trim() || "First stash" });
         } else {
-          await createTeamAndProject({ teamName, stashName });
+          await createTeamAndStash({ teamName, stashName });
         }
       } else {
-        await completeOnboarding({ scope: "user", projectName: stashName.trim() || "First stash", projectDescription: "", stashName });
+        await completeOnboarding({ scope: "user", stashName: stashName.trim() || "First stash" });
       }
       onComplete();
     } catch (e) {
@@ -89,39 +82,33 @@ export default function Onboarding({ onComplete, initialScope, organizationId }:
       : stashName.trim().length > 0;
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "var(--overlay-bg)", backdropFilter: "blur(6px)", zIndex: 100, display: "grid", placeItems: "center", padding: 20 }}>
-      <div style={{
-        width: "min(440px, 100%)", background: "var(--surface-solid)", border: "1px solid var(--border-default)", borderRadius: 16,
-        boxShadow: "0 30px 70px rgba(var(--shadow-color),.18)", padding: "30px 28px", animation: "sd-sheet .24s cubic-bezier(.2,.8,.2,1) both",
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 20 }}>
+    <div className="fixed inset-0 z-100 grid place-items-center bg-overlay p-5 backdrop-blur-[6px]">
+      <div className="w-[min(440px,100%)] animate-sheet rounded-[16px] border border-default bg-surface-solid px-7 py-[30px] shadow-[0_30px_70px_rgba(var(--shadow-color),.18)] [animation-duration:.24s]">
+        <div className="mb-5 flex items-center gap-1.5">
           {steps.map((_, i) => (
-            <div key={i} style={{ height: 3, flex: 1, borderRadius: 2, background: i <= step ? "var(--text-primary)" : "var(--border-default)" }} />
+            <div key={i} className={`h-[3px] flex-1 rounded-sm ${i <= step ? "bg-primary" : "bg-default"}`} />
           ))}
         </div>
         {steps.length > 1 && (
-          <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "var(--text-faint)", marginBottom: 6 }}>
+          <div className="mb-1.5 font-mono text-[10px] uppercase tracking-[.1em] text-faint">
             Step {step + 1} of {steps.length}
           </div>
         )}
-        <div style={{ fontFamily: SERIF, fontSize: 24, color: "var(--text-primary)", marginBottom: 20 }}>{steps[step]}</div>
+        <div className="mb-5 font-serif text-2xl text-primary">{steps[step]}</div>
 
         {!initialScope && step === 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div className="flex flex-col gap-2.5">
             {invites.map((invite) => (
               <button
                 key={invite.id}
                 onClick={() => joinInvite(invite)}
                 disabled={busy}
-                style={{
-                  display: "flex", alignItems: "center", gap: 12, textAlign: "left", cursor: busy ? "default" : "pointer",
-                  border: "1px solid var(--accent-border)", background: "var(--accent-bg)", borderRadius: 10, padding: "13px 14px",
-                }}
+                className={`flex cursor-pointer items-center gap-3 rounded-[10px] border border-accent-border bg-accent-bg px-3.5 py-[13px] text-left ${busy ? "cursor-default" : "cursor-pointer"}`}
               >
-                <Mail size={18} color="var(--text-secondary)" />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: "var(--text-primary)" }}>Join {invite.organizationName}</div>
-                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 1 }}>You&apos;ve been invited to this team.</div>
+                <Mail size={18} className="text-secondary" />
+                <div className="flex-1">
+                  <div className="text-sm font-medium text-primary">Join {invite.organizationName}</div>
+                  <div className="mt-px text-xs text-muted">You&apos;ve been invited to this team.</div>
                 </div>
               </button>
             ))}
@@ -132,54 +119,43 @@ export default function Onboarding({ onComplete, initialScope, organizationId }:
               <button
                 key={o.id}
                 onClick={() => setScope(o.id)}
-                style={{
-                  display: "flex", alignItems: "center", gap: 12, textAlign: "left", cursor: "pointer",
-                  border: `1px solid ${scope === o.id ? "var(--text-primary)" : "var(--border-default)"}`,
-                  background: scope === o.id ? "var(--accent-bg)" : "var(--card-bg)", borderRadius: 10, padding: "13px 14px",
-                }}
+                className={`flex cursor-pointer items-center gap-3 rounded-[10px] border px-3.5 py-[13px] text-left ${scope === o.id ? "border-primary bg-accent-bg" : "border-default bg-card"}`}
               >
-                <o.Icon size={18} color="var(--text-secondary)" />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: "var(--text-primary)" }}>{o.label}</div>
-                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 1 }}>{o.desc}</div>
+                <o.Icon size={18} className="text-secondary" />
+                <div className="flex-1">
+                  <div className="text-sm font-medium text-primary">{o.label}</div>
+                  <div className="mt-px text-xs text-muted">{o.desc}</div>
                 </div>
-                {scope === o.id && <Check size={16} color="var(--text-primary)" />}
+                {scope === o.id && <Check size={16} className="text-primary" />}
               </button>
             ))}
             {scope === "organization" && (
-              <input value={teamName} onChange={(e) => setTeamName(e.target.value)} placeholder="Team name" style={inputStyle} autoFocus />
+              <input value={teamName} onChange={(e) => setTeamName(e.target.value)} placeholder="Team name" className={inputClass} autoFocus />
             )}
           </div>
         )}
 
         {step === steps.length - 1 && (
           <div>
-            <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 12 }}>
+            <div className="mb-3 text-[13px] text-muted">
               A stash is your board — everything you keep lives here. You can make more later.
             </div>
-            <input value={stashName} onChange={(e) => setStashName(e.target.value)} placeholder="First stash" style={inputStyle} autoFocus />
+            <input value={stashName} onChange={(e) => setStashName(e.target.value)} placeholder="First stash" className={inputClass} autoFocus />
           </div>
         )}
 
-        {error && <div style={{ fontSize: 12.5, color: "var(--danger)", marginTop: 12 }}>{error}</div>}
+        {error && <div className="mt-3 text-[12.5px] text-danger">{error}</div>}
 
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 24 }}>
+        <div className="mt-6 flex justify-between">
           <button
             onClick={() => setStep((s) => s - 1)}
             disabled={step === 0 || busy}
-            style={{
-              border: "none", background: "none", color: "var(--text-muted)", fontSize: 13, cursor: step === 0 ? "default" : "pointer",
-              opacity: step === 0 ? 0 : 1, padding: "8px 4px",
-            }}
+            className={`border-none bg-transparent px-1 py-2 text-[13px] text-muted ${step === 0 ? "cursor-default opacity-0" : "cursor-pointer"}`}
           >Back</button>
           <button
             onClick={() => (step < steps.length - 1 ? setStep((s) => s + 1) : finish())}
             disabled={!canContinue || busy}
-            style={{
-              border: "1px solid var(--text-primary)", background: "var(--text-primary)", color: "var(--card-bg)",
-              borderRadius: 8, padding: "9px 18px", fontSize: 13.5, fontWeight: 500,
-              cursor: canContinue && !busy ? "pointer" : "not-allowed", opacity: canContinue && !busy ? 1 : 0.45,
-            }}
+            className={`rounded-lg border border-primary bg-primary px-[18px] py-[9px] text-[13.5px] font-medium text-card ${canContinue && !busy ? "cursor-pointer" : "cursor-not-allowed opacity-45"}`}
           >{busy ? "Setting up…" : step < steps.length - 1 ? "Continue" : "Start stashing"}</button>
         </div>
       </div>

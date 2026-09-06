@@ -2,14 +2,14 @@
 
 > Everything you've kept, in one place.
 
-Stashdrop is a local-first bookmarking app with a canvas desk. Keep a link — an article, video, image, PDF, repo, screenshot — and it lands on an infinite canvas as a card. AI running on your own machine files it into a pile, tags it, and describes why you kept it.
+Stashdrop is a local-first bookmarking app with a canvas desk. Keep a link — an article, video, image, PDF, repo, screenshot — and it lands on an infinite canvas as a card. AI running on your own machine files it into a folder, tags it, and describes why you kept it.
 
 ## Features
 
-- **Canvas desk** — saved links and notes float on an infinite canvas, arranged into piles. Drag to reposition; positions persist.
-- **Piles** — items are filed into clusters (Local-first & sync, Creator video, Type & print, Unsorted, …) with a "why it belongs here" note.
+- **Canvas desk** — saved links and notes float on an infinite canvas, arranged into folders. Drag to reposition; positions persist.
+- **Folders** — items are filed into clusters (Local-first & sync, Creator video, Type & print, Unsorted, …) with a "why it belongs here" note.
 - **Capture by URL** — paste a link and Stashdrop fetches the page server-side, detects its kind, and drops a card immediately; a background pass enriches it while you watch.
-- **Local AI enrichment** — Ollama (running locally) summarizes the page, picks tags, chooses a pile, and pulls notable highlights.
+- **Local AI enrichment** — Ollama (running locally) summarizes the page, picks tags, chooses a folder, and pulls notable highlights.
 - **Semantic search & related links** — every item gets an embedding; search matches by meaning, and items link to the nearest neighbors in your stash.
 - **Sticky notes & comments** — drop freeform notes on the canvas, and attach discussion threads to any card.
 - **Workspaces** — a personal space plus teams (organizations) with invites, owner/admin/member roles, and per-workspace stashes.
